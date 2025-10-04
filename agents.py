@@ -8,7 +8,7 @@ from typing import TypedDict, Annotated, List, Dict
 from langgraph.graph.message import add_messages
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Make sure 'tools.py' is in the same directory and contains the tool definitions
-from tools import terraform_validate_tool, terraform_apply_tool
+from tools import terraform_validate_tool, terraform_apply_tool, terraform_security_scan_tool
 
 # --- Define Graph State ---
 # This TypedDict represents the shared state that flows through the graph.
@@ -22,6 +22,8 @@ class GraphState(TypedDict):
     deployment_report: str
     human_feedback: str
     validation_passed: bool
+    security_report: str
+    security_passed: bool
     retry_count: int
     messages: Annotated[list, add_messages]
 
@@ -36,72 +38,125 @@ llm = ChatGoogleGenerativeAI(
 
 # --- Agent Classes ---
 
-class PlannerAgent:
-    """Creates the initial high-level plan based on the user's request."""
+class PlannerArchitectAgent:
+    """Creates plan AND file structure with detailed briefs in one step - eliminates information loss."""
     def run(self, state: GraphState):
-        print("--- 🧠 PLANNER AGENT ---")
+        print("--- 🧠💡 PLANNER + ARCHITECT AGENT ---")
         error_context = ""
         # If a previous run failed, add the error report to the context for the LLM to fix.
         if state.get("validation_report") and not state.get("validation_passed"):
             error_context = f"""
-An attempt to generate and validate code has failed. Create a new, simpler plan to fix the errors below.
-Focus on the simplest possible resource structure to meet the original request.
-Validation Errors:
+**PREVIOUS ATTEMPT FAILED - YOU MUST FIX THESE ERRORS:**
+
 {state['validation_report']}
+
+**FIXING INSTRUCTIONS:**
+1. Read the errors above CAREFULLY
+2. Create a SIMPLER plan and file structure that avoids these errors
+3. If syntax errors: ensure briefs specify proper HCL syntax requirements
+4. If security errors: include security features in the briefs (encryption, access blocks, etc.)
+5. Make briefs MORE DETAILED and SPECIFIC
+6. Keep the plan minimal (3-5 steps maximum)
 """
-        prompt = f"""You are an expert infrastructure planner for AWS running on LocalStack. Your job is to create a high-level, step-by-step plan in plain English.
+        
+        prompt = f"""You are an expert Terraform architect. You must create BOTH a minimal implementation plan AND detailed file structure in ONE response.
 
-**CRITICAL RULES:**
-1.  Read the user's request and any error context carefully.
-2.  Your output MUST be a numbered list of simple, high-level steps.
-3.  **DO NOT WRITE ANY HCL CODE OR TERRAFORM SNIPPETS.** Your role is to plan, not to code.
-4.  The plan should only include the AWS resources the user explicitly asked for. Do not add extra complexity.
-5.  If there are validation errors, your plan should aim to simplify the approach.
+**YOUR TASK:**
+1. Create a 3-5 step implementation plan (high-level, plain English)
+2. Define which Terraform files are needed
+3. For EACH file, provide a VERY DETAILED brief that includes:
+   - Exact resource types to create (e.g., aws_s3_bucket, aws_s3_bucket_server_side_encryption_configuration)
+   - Specific configurations needed (encryption: AES256, versioning: Enabled, etc.)
+   - Security requirements (public access: blocked, encryption: enabled)
+   - Resource relationships and dependencies
+   - All attributes that must be set
 
-**User Request:** "{state['initial_request']}"
+**CRITICAL CONSTRAINTS:**
+- Plan must be 3-5 steps MAXIMUM
+- Only plan what user EXPLICITLY requested - no extras
+- DO NOT add variables.tf unless user mentioned "configurable" or "parameters"
+- DO NOT add outputs.tf unless user asked to "see", "get", or "output" something
+- Keep resources at their SIMPLEST viable configuration
+- Security features should be detailed in briefs
+
+**USER REQUEST:** "{state['initial_request']}"
 {state.get('human_feedback', '')}
 {error_context}
 
-Provide a concise, step-by-step plan in plain English for deploying this on AWS via LocalStack.
+**OUTPUT FORMAT (MUST BE VALID JSON):**
+{{
+  "plan": "1. Configure AWS provider\\n2. Create S3 bucket with security\\n3. Add encryption configuration",
+  "files": [
+    {{
+      "file_name": "provider.tf",
+      "brief": "Configure AWS provider for LocalStack with region us-east-1, test credentials, and endpoints for s3 pointing to http://localhost:4566"
+    }},
+    {{
+      "file_name": "main.tf",
+      "brief": "Create aws_s3_bucket resource named 'example' with bucket name from var or hardcoded. Create aws_s3_bucket_server_side_encryption_configuration resource with sse_algorithm AES256. Create aws_s3_bucket_public_access_block resource with all four settings (block_public_acls, block_public_policy, ignore_public_acls, restrict_public_buckets) set to true. Create aws_s3_bucket_versioning resource with status Enabled."
+    }}
+  ]
+}}
+
+**EXAMPLE OF GOOD DETAILED BRIEF:**
+"Create aws_dynamodb_table resource named 'users' with hash_key 'id' of type S, billing_mode PAY_PER_REQUEST, server_side_encryption block with enabled true, point_in_time_recovery block with enabled true"
+
+**EXAMPLE OF BAD BRIEF (too vague):**
+"Create DynamoDB table" ← NEVER DO THIS!
+
+Now generate the JSON response with plan and detailed file structure for: {state['initial_request']}
 """
+        
         response = llm.invoke(prompt)
-        print(f"--- Raw Planner Response ---\n{response.content}\n--------------------------")
-        # Reset state for the new plan
-        return {
-            "plan": response.content,
-            "generated_files": {},
-            "file_structure": [],
-            "validation_report": ""
-        }
-
-class FileArchitectAgent:
-    """Decides which .tf files are needed and what their purpose is."""
-    def run(self, state: GraphState):
-        print("--- 🏛️ FILE ARCHITECT AGENT ---")
-        prompt = f"""You are a Terraform file architect. Based on the plan, define the project structure by specifying which files to create and a clear, one-sentence brief for each.
-
-**RULES:**
-1.  Always create a `provider.tf` to configure the AWS provider for LocalStack.
-2.  If the plan involves configurable values, create a `variables.tf`.
-3.  The main resources go into `main.tf`.
-4.  If resources produce outputs, create an `outputs.tf`.
-5.  Your output **MUST** be a valid JSON list of objects, with "file_name" and "brief" keys.
-
-**Plan:**
-{state['plan']}
-
-Provide your response as a JSON list.
-"""
-        response = llm.invoke(prompt)
-        print(f"--- Raw Architect Response ---\n{response.content}\n----------------------------")
+        print(f"--- Raw Planner+Architect Response ---\n{response.content}\n--------------------------")
+        
         try:
-            # Clean up potential markdown formatting from the LLM response
+            # Clean up potential markdown formatting
             cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
-            file_structure = json.loads(cleaned_response)
-            return {"file_structure": file_structure}
-        except json.JSONDecodeError:
-            print("❌ ERROR: Architect agent did not return valid JSON.")
-            return {"file_structure": []}
+            parsed = json.loads(cleaned_response)
+            
+            plan = parsed.get("plan", "")
+            file_structure = parsed.get("files", [])
+            
+            if not plan or not file_structure:
+                print("⚠️ Warning: Response missing plan or files. Using fallback.")
+                return {
+                    "plan": "1. Configure provider\n2. Create main resources",
+                    "file_structure": [
+                        {"file_name": "provider.tf", "brief": "Configure AWS provider for LocalStack"},
+                        {"file_name": "main.tf", "brief": f"Create resources for: {state['initial_request']}"}
+                    ],
+                    "generated_files": {},
+                    "validation_report": "",
+                    "security_report": ""
+                }
+            
+            print(f"✅ Plan: {plan}")
+            print(f"✅ File Structure: {len(file_structure)} files")
+            
+            # Reset state for the new plan
+            return {
+                "plan": plan,
+                "file_structure": file_structure,
+                "generated_files": {},
+                "validation_report": "",
+                "security_report": ""
+            }
+            
+        except json.JSONDecodeError as e:
+            print(f"❌ ERROR: PlannerArchitect did not return valid JSON: {e}")
+            print(f"Response was: {response.content[:500]}")
+            # Provide fallback structure
+            return {
+                "plan": "1. Configure AWS provider\n2. Create requested resources",
+                "file_structure": [
+                    {"file_name": "provider.tf", "brief": "Configure AWS provider for LocalStack with all required endpoints"},
+                    {"file_name": "main.tf", "brief": f"Create all resources needed for: {state['initial_request']}"}
+                ],
+                "generated_files": {},
+                "validation_report": "",
+                "security_report": ""
+            }
 
 class CodeGeneratorAgent:
     """Generates HCL code for a single file based on a brief."""
@@ -225,3 +280,31 @@ class DeployerAgent:
         print(f"--- Deployment Report ---\n{deployment_report}\n-------------------------")
         
         return {"deployment_report": deployment_report}
+
+class SecurityScannerAgent:
+    """Scans the validated Terraform code for security vulnerabilities using tfsec."""
+    def run(self, state: GraphState):
+        print("--- 🛡️ SECURITY SCANNER AGENT ---")
+        files = state["generated_files"]
+        
+        # Invoke the security scan tool
+        security_report = terraform_security_scan_tool.invoke({"files": files})
+        security_passed = "No security issues detected" in security_report
+
+        if security_passed:
+            print("✅ tfsec security scan passed.")
+            return {
+                "security_report": security_report,
+                "security_passed": True
+            }
+        else:
+            print("❌ tfsec security scan found issues.")
+            # Append security issues to validation_report so PlannerAgent can address them
+            existing_report = state.get("validation_report", "")
+            combined_report = f"{existing_report}\n\n--- SECURITY ISSUES ---\n{security_report}"
+            return {
+                "security_report": security_report,
+                "security_passed": False,
+                "validation_report": combined_report,
+                "validation_passed": False  # Mark validation as failed to trigger retry
+            }

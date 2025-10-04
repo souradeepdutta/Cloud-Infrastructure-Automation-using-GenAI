@@ -10,7 +10,8 @@ from agents import (
     FileArchitectAgent,
     CodeGeneratorAgent,
     CodeValidatorAgent,
-    DeployerAgent
+    DeployerAgent,
+    SecurityScannerAgent
 )
 
 # --- Instantiate Agents ---
@@ -18,6 +19,7 @@ planner_agent = PlannerAgent()
 file_architect_agent = FileArchitectAgent()
 code_generator_agent = CodeGeneratorAgent()
 code_validator_agent = CodeValidatorAgent()
+security_scanner_agent = SecurityScannerAgent()
 deployer_agent = DeployerAgent()
 
 # --- Define Graph Logic and Routers ---
@@ -33,13 +35,23 @@ def generation_router(state: GraphState):
         return "code_validator"
 
 def validation_router(state: GraphState):
-    """Routes after validation. To deployer if passed, to final_router if failed."""
+    """Routes after validation. To security scanner if passed, to final_router if failed."""
     print("--- 🚦 VALIDATION ROUTER ---")
     if state.get("validation_passed"):
-        print("✅ Validation OK. Proceeding to Deployer.")
-        return "deployer"
+        print("✅ Validation OK. Proceeding to Security Scanner.")
+        return "security_scanner"
     
     print("❌ Validation failed. Checking for retry.")
+    return "final_router"
+
+def security_router(state: GraphState):
+    """Routes after security scan. To deployer if passed, to final_router if failed."""
+    print("--- 🛡️ SECURITY ROUTER ---")
+    if state.get("security_passed"):
+        print("✅ Security Scan OK. Proceeding to Deployer.")
+        return "deployer"
+    
+    print("❌ Security Scan failed. Checking for retry.")
     return "final_router"
 
 def final_router(state: GraphState):
@@ -78,6 +90,7 @@ workflow.add_node("planner", planner_agent.run)
 workflow.add_node("file_architect", file_architect_agent.run)
 workflow.add_node("code_generator", code_generator_agent.run)
 workflow.add_node("code_validator", code_validator_agent.run)
+workflow.add_node("security_scanner", security_scanner_agent.run)
 workflow.add_node("deployer", deployer_agent.run)
 # === THIS IS THE FIX ===
 # You must add the router as a node if you want to create an edge from it.
@@ -104,6 +117,15 @@ workflow.add_conditional_edges(
 workflow.add_conditional_edges(
     "code_validator",
     validation_router,
+    {
+        "security_scanner": "security_scanner",
+        "final_router": "final_router"
+    }
+)
+
+workflow.add_conditional_edges(
+    "security_scanner",
+    security_router,
     {
         "deployer": "deployer",
         "final_router": "final_router"
@@ -172,7 +194,10 @@ def main():
             print(code)
             print()
         
-        print("\n--- 🚀 DEPLOYMENT REPORT ---")
+        print("\n--- �️ SECURITY REPORT ---")
+        print(final_state.get("security_report", "No security scan was performed."))
+        
+        print("\n--- �🚀 DEPLOYMENT REPORT ---")
         print(final_state.get("deployment_report", "No deployment was attempted."))
 
         print("\n--- 🧑‍💻 HUMAN REVIEW ---")

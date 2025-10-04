@@ -89,6 +89,54 @@ def terraform_validate_tool(files: dict[str, str]) -> str:
         return f"An unexpected error occurred: {str(e)}"
 
 @tool
+def terraform_security_scan_tool(files: dict[str, str]) -> str:
+    """
+    Scans a dictionary of Terraform files for security issues using tfsec.
+    The dictionary keys are filenames and values are the code content.
+    Uses the same WORK_DIR where validation was performed to avoid redundant operations.
+    Returns a success message if no issues are found, or a detailed report of the issues.
+    """
+    try:
+        # Use the same work directory where validation was already performed
+        # This ensures we scan the exact files that were validated
+        if not os.path.exists(WORK_DIR):
+            return "Error: Work directory not found. Please run validation first."
+        
+        # Run tfsec and capture the output.
+        # tfsec exits with 0 if no problems are found.
+        # It exits with a non-zero code if issues are detected.
+        scan_result = subprocess.run(
+            ["tfsec", ".", "--no-color", "--format", "default"],
+            cwd=WORK_DIR, capture_output=True, text=True
+        )
+
+        # If no output and successful return code, all is well
+        if scan_result.returncode == 0 and not scan_result.stdout.strip():
+            return "Security scan passed. No security issues detected by tfsec."
+        
+        # Build a comprehensive report
+        report = "Security scan detected issues.\n\n"
+        if scan_result.stdout:
+            report += f"tfsec Report:\n{scan_result.stdout}\n"
+        if scan_result.stderr:
+            report += f"\nErrors:\n{scan_result.stderr}"
+
+        return report
+
+    except FileNotFoundError:
+        return (
+            "Error: `tfsec` command not found. Please ensure it is installed and in your PATH.\n"
+            "Installation instructions:\n"
+            "  - Windows (choco): choco install tfsec\n"
+            "  - Windows (scoop): scoop install tfsec\n"
+            "  - Windows (manual): Download from https://github.com/aquasecurity/tfsec/releases\n"
+            "  - macOS: brew install tfsec\n"
+            "  - Linux: Download from https://github.com/aquasecurity/tfsec/releases"
+        )
+    except Exception as e:
+        return f"An unexpected error occurred during security scan: {str(e)}"
+
+@tool
 def terraform_apply_tool(files: dict[str, str]) -> str:
     """
     Applies the given Terraform configuration to LocalStack.

@@ -28,11 +28,10 @@ class GraphState(TypedDict):
     messages: Annotated[list, add_messages]
 
 # --- Configure LLM ---
-# We configure the connection to the Google Gemini model here.
-# The model version is specified for consistent results.
+# Gemini 2.5 Flash with reasoning mode for better planning
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
-    temperature=0.3,  # Lower temperature for more deterministic, code-focused output
+    temperature=0.0,  # Maximum determinism for consistent code generation
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
 
@@ -41,74 +40,59 @@ llm = ChatGoogleGenerativeAI(
 class PlannerArchitectAgent:
     """Creates plan AND file structure with detailed briefs in one step - eliminates information loss."""
     def run(self, state: GraphState):
-        print("--- 🧠💡 PLANNER + ARCHITECT AGENT ---")
+        print("\n🧠 Planning architecture...")
         error_context = ""
         # If a previous run failed, add the error report to the context for the LLM to fix.
         if state.get("validation_report") and not state.get("validation_passed"):
             error_context = f"""
-**PREVIOUS ATTEMPT FAILED - YOU MUST FIX THESE ERRORS:**
-
+⚠️ PREVIOUS ERRORS TO FIX:
 {state['validation_report']}
 
-**FIXING INSTRUCTIONS:**
-1. Read the errors above CAREFULLY
-2. Create a SIMPLER plan and file structure that avoids these errors
-3. If syntax errors: ensure briefs specify proper HCL syntax requirements
-4. If security errors: include security features in the briefs (encryption, access blocks, etc.)
-5. Make briefs MORE DETAILED and SPECIFIC
-6. Keep the plan minimal (3-5 steps maximum)
+FIX BY: Simplifying the plan, ensuring security resources are separate, and being more specific in briefs.
 """
         
-        prompt = f"""You are an expert Terraform architect. You must create BOTH a minimal implementation plan AND detailed file structure in ONE response.
+        prompt = f"""Think step-by-step to create a MINIMAL Terraform architecture.
 
-**YOUR TASK:**
-1. Create a 3-5 step implementation plan (high-level, plain English)
-2. Define which Terraform files are needed
-3. For EACH file, provide a VERY DETAILED brief that includes:
-   - Exact resource types to create (e.g., aws_s3_bucket, aws_s3_bucket_server_side_encryption_configuration)
-   - Specific configurations needed (encryption: AES256, versioning: Enabled, etc.)
-   - Security requirements (public access: blocked, encryption: enabled)
-   - Resource relationships and dependencies
-   - All attributes that must be set
-
-**CRITICAL CONSTRAINTS:**
-- Plan must be 3-5 steps MAXIMUM
-- Only plan what user EXPLICITLY requested - no extras
-- DO NOT add variables.tf unless user mentioned "configurable" or "parameters"
-- DO NOT add outputs.tf unless user asked to "see", "get", or "output" something
-- Keep resources at their SIMPLEST viable configuration
-- Security features should be detailed in briefs
-
-**USER REQUEST:** "{state['initial_request']}"
-{state.get('human_feedback', '')}
+User wants: {state['initial_request']}
 {error_context}
 
-**OUTPUT FORMAT (MUST BE VALID JSON):**
+Reasoning process:
+1. What AWS resources are EXPLICITLY requested? (Don't add extras)
+2. What security configs are MANDATORY for these resources?
+3. What files are needed? (provider.tf always + main.tf)
+
+🔐 SECURITY REQUIREMENTS (separate resources):
+S3: bucket + encryption_configuration(AES256) + public_access_block(all true) + versioning(Enabled)
+DynamoDB: table with server_side_encryption + point_in_time_recovery blocks
+Lambda: function + iam_role + tracing_config(Active)
+EC2: encrypted volumes + metadata_options(http_tokens=required) + no public IP
+RDS: storage_encrypted + not publicly_accessible + backup_retention >= 7
+
+⚠️ KEEP IT SIMPLE:
+- NO variables.tf or outputs.tf unless explicitly requested
+- NO KMS keys (use AES256)
+- NO log buckets (unless asked)
+- 3-4 steps max in plan
+
+OUTPUT JSON:
 {{
-  "plan": "1. Configure AWS provider\\n2. Create S3 bucket with security\\n3. Add encryption configuration",
+  "plan": "1. Setup provider\\n2. Create [resource]\\n3. Add security configs",
   "files": [
-    {{
-      "file_name": "provider.tf",
-      "brief": "Configure AWS provider for LocalStack with region us-east-1, test credentials, and endpoints for s3 pointing to http://localhost:4566"
-    }},
-    {{
-      "file_name": "main.tf",
-      "brief": "Create aws_s3_bucket resource named 'example' with bucket name from var or hardcoded. Create aws_s3_bucket_server_side_encryption_configuration resource with sse_algorithm AES256. Create aws_s3_bucket_public_access_block resource with all four settings (block_public_acls, block_public_policy, ignore_public_acls, restrict_public_buckets) set to true. Create aws_s3_bucket_versioning resource with status Enabled."
-    }}
+    {{"file_name": "provider.tf", "brief": "AWS provider for LocalStack: region us-east-1, test creds, endpoints http://localhost:4566"}},
+    {{"file_name": "main.tf", "brief": "Resource-by-resource list: aws_s3_bucket 'my_bucket' bucket='name', aws_s3_bucket_server_side_encryption_configuration sse_algorithm=AES256, aws_s3_bucket_public_access_block all=true, aws_s3_bucket_versioning status=Enabled"}}
   ]
 }}
 
-**EXAMPLE OF GOOD DETAILED BRIEF:**
-"Create aws_dynamodb_table resource named 'users' with hash_key 'id' of type S, billing_mode PAY_PER_REQUEST, server_side_encryption block with enabled true, point_in_time_recovery block with enabled true"
-
-**EXAMPLE OF BAD BRIEF (too vague):**
-"Create DynamoDB table" ← NEVER DO THIS!
-
-Now generate the JSON response with plan and detailed file structure for: {state['initial_request']}
+GOOD brief: "aws_dynamodb_table 'users' hash_key='id':S billing_mode=PAY_PER_REQUEST server_side_encryption enabled=true point_in_time_recovery enabled=true"
+BAD brief: "Create DynamoDB table" (too vague!)
 """
         
+        # Add human feedback if provided
+        if state.get('human_feedback'):
+            prompt += f"\n\nHuman feedback: {state['human_feedback']}"
+        
         response = llm.invoke(prompt)
-        print(f"--- Raw Planner+Architect Response ---\n{response.content}\n--------------------------")
+        # Debug output hidden for cleaner console
         
         try:
             # Clean up potential markdown formatting
@@ -131,8 +115,7 @@ Now generate the JSON response with plan and detailed file structure for: {state
                     "security_report": ""
                 }
             
-            print(f"✅ Plan: {plan}")
-            print(f"✅ File Structure: {len(file_structure)} files")
+            print(f"✅ Plan created: {len(file_structure)} files to generate")
             
             # Reset state for the new plan
             return {
@@ -170,20 +153,16 @@ class CodeGeneratorAgent:
         file_name = current_file_spec["file_name"]
         brief = current_file_spec["brief"]
 
-        print(f"--- 💻 CODE GENERATOR AGENT (File: {file_name}) ---")
-        prompt = f"""You are a Terraform code generator. Your task is to write HCL code for the file `{file_name}` to deploy AWS resources to LocalStack.
+        print(f"\n💻 Generating {file_name}...")
+        prompt = f"""Generate HCL code for {file_name}. Output ONLY code, no explanations.
 
-**CONTEXT:**
-- **This File's Purpose (`{file_name}`):** {brief}
-- **Complete File Structure Plan:** {[f['file_name'] for f in state['file_structure']] + [file_name]}
-- **Already Generated Files (for reference):**
-{json.dumps(state.get('generated_files', {}), indent=2)}
+Brief: {brief}
 
-**RULES:**
-1.  Generate ONLY the HCL code for `{file_name}`. Do not add any explanations or markdown.
-2.  **Strictly adhere to the file's brief.**
-3.  **ARCHITECTURE RULE:** `variable` blocks go ONLY in `variables.tf`. `output` blocks go ONLY in `outputs.tf`. `provider` blocks go ONLY in `provider.tf`.
-4.  **LOCALSTACK PROVIDER RULE:** If you are writing the `provider.tf` file, you **MUST** configure it to point to LocalStack endpoints. Use the example below.
+RULES:
+- Follow the brief exactly
+- For provider.tf: LocalStack endpoints (us-east-1, test creds, http://localhost:4566)
+- Use .id for resource references (e.g., aws_s3_bucket.name.id)
+- Keep code clean and minimal
 
 **Correct `provider.tf` for LocalStack:**
 ```hcl
@@ -226,7 +205,7 @@ Now, generate the complete and correct HCL code for the file: {file_name}.
         response = llm.invoke(prompt)
         # Clean up markdown formatting
         generated_code = response.content.strip().replace("```hcl", "").replace("```", "")
-        print(f"--- Raw Generator Response ({file_name}) ---\n{generated_code}\n--------------------------------------")
+        print(f"✓ Generated {file_name}")
         
         # Generated code
         updated_files = state.get("generated_files", {})
@@ -241,7 +220,7 @@ Now, generate the complete and correct HCL code for the file: {file_name}.
 class CodeValidatorAgent:
     """Validates the entire set of generated Terraform files using the custom tool."""
     def run(self, state: GraphState):
-        print("--- 🔍 CODE VALIDATOR AGENT ---")
+        print("\n🔍 Validating Terraform code...")
         files = state["generated_files"]
         
         # Invoke the tool that runs `terraform init`, `validate`, and `fmt`
@@ -270,21 +249,21 @@ class CodeValidatorAgent:
 class DeployerAgent:
     """Deploys the validated code to LocalStack using the custom tool."""
     def run(self, state: GraphState):
-        print("--- 🚀 DEPLOYER AGENT ---")
+        print("\n🚀 Deploying to LocalStack...")
         if not state.get("validation_passed"):
             return {"deployment_report": "Skipping deployment because validation failed."}
         
         files = state["generated_files"]
         # Invoke the tool that runs `terraform apply`
         deployment_report = terraform_apply_tool.invoke({"files": files})
-        print(f"--- Deployment Report ---\n{deployment_report}\n-------------------------")
+        print("✅ Deployment complete")
         
         return {"deployment_report": deployment_report}
 
 class SecurityScannerAgent:
     """Scans the validated Terraform code for security vulnerabilities using tfsec."""
     def run(self, state: GraphState):
-        print("--- 🛡️ SECURITY SCANNER AGENT ---")
+        print("\n🛡️ Running security scan (tfsec)...")
         files = state["generated_files"]
         
         # Invoke the security scan tool

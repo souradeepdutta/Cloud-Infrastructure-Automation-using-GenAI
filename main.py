@@ -6,8 +6,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from agents import (
     GraphState,
-    PlannerAgent,
-    FileArchitectAgent,
+    PlannerArchitectAgent,
     CodeGeneratorAgent,
     CodeValidatorAgent,
     DeployerAgent,
@@ -15,8 +14,7 @@ from agents import (
 )
 
 # --- Instantiate Agents ---
-planner_agent = PlannerAgent()
-file_architect_agent = FileArchitectAgent()
+planner_architect_agent = PlannerArchitectAgent()
 code_generator_agent = CodeGeneratorAgent()
 code_validator_agent = CodeValidatorAgent()
 security_scanner_agent = SecurityScannerAgent()
@@ -26,68 +24,52 @@ deployer_agent = DeployerAgent()
 
 def generation_router(state: GraphState):
     """Determines if there are more files to generate or if it's time to validate."""
-    print("--- 🔄 GENERATION ROUTER ---")
     if state.get("file_structure") and len(state["file_structure"]) > 0:
-        print(f"{len(state['file_structure'])} file(s) remaining. Continuing generation.")
         return "code_generator"
     else:
-        print("All files generated. Proceeding to validation.")
         return "code_validator"
 
 def validation_router(state: GraphState):
     """Routes after validation. To security scanner if passed, to final_router if failed."""
-    print("--- 🚦 VALIDATION ROUTER ---")
     if state.get("validation_passed"):
-        print("✅ Validation OK. Proceeding to Security Scanner.")
         return "security_scanner"
-    
-    print("❌ Validation failed. Checking for retry.")
     return "final_router"
 
 def security_router(state: GraphState):
     """Routes after security scan. To deployer if passed, to final_router if failed."""
-    print("--- 🛡️ SECURITY ROUTER ---")
     if state.get("security_passed"):
-        print("✅ Security Scan OK. Proceeding to Deployer.")
         return "deployer"
-    
-    print("❌ Security Scan failed. Checking for retry.")
     return "final_router"
 
 def final_router(state: GraphState):
     """The final router node that updates state after validation failure."""
-    print("--- 🏁 FINAL ROUTER ---")
     retry_count = state.get("retry_count", 0)
     
     if state.get("human_feedback"):
-        print("🧑‍💻 Human feedback received. Returning to planner.")
-        # Return empty dict since we're just routing, state already has feedback
         return {}
 
     if retry_count < 3:
-        print(f"Attempt {retry_count + 1} failed. Returning to planner for adjustments.")
-        # Increment retry count in the returned state update
+        print(f"\n⚠️ Attempt {retry_count + 1} failed. Retrying with improvements...")
         return {"retry_count": retry_count + 1}
 
-    print("❌ Process repeatedly failed. Ending.")
+    print("\n❌ Maximum retries reached.")
     return {}
 
 def final_router_condition(state: GraphState):
     """Determines the next step after final_router node."""
     retry_count = state.get("retry_count", 0)
     if state.get("human_feedback"):
-        return "planner"
+        return "planner_architect"
     
     if retry_count < 3:
-        return "planner"
+        return "planner_architect"
     
     return "end"
 
 # --- Build the Graph ---
 workflow = StateGraph(GraphState)
 
-workflow.add_node("planner", planner_agent.run)
-workflow.add_node("file_architect", file_architect_agent.run)
+workflow.add_node("planner_architect", planner_architect_agent.run)
 workflow.add_node("code_generator", code_generator_agent.run)
 workflow.add_node("code_validator", code_validator_agent.run)
 workflow.add_node("security_scanner", security_scanner_agent.run)
@@ -97,16 +79,10 @@ workflow.add_node("deployer", deployer_agent.run)
 workflow.add_node("final_router", final_router)
 
 
-workflow.set_entry_point("planner")
+workflow.set_entry_point("planner_architect")
 
-workflow.add_edge("planner", "file_architect")
+workflow.add_edge("planner_architect", "code_generator")
 workflow.add_edge("deployer", END)
-
-workflow.add_conditional_edges(
-    "file_architect",
-    generation_router,
-    {"code_generator": "code_generator", "code_validator": "code_validator"}
-)
 
 workflow.add_conditional_edges(
     "code_generator",
@@ -136,7 +112,7 @@ workflow.add_conditional_edges(
 workflow.add_conditional_edges(
     "final_router",
     final_router_condition,  # Use the separate condition function
-    {"end": END, "planner": "planner"}
+    {"end": END, "planner_architect": "planner_architect"}
 )
 
 # Compile the graph
@@ -149,8 +125,11 @@ def main():
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
     
-    print("🤖 Welcome to the LocalStack Terraform Bot! 🤖")
-    print("Start by describing the AWS infrastructure you want to build. Type 'quit' to stop.")
+    print("="*60)
+    print("🤖 AWS Infrastructure Generator (LocalStack)")
+    print("="*60)
+    print("Describe the infrastructure you want to build.")
+    print("Type 'quit' to exit.\n")
 
     initial_request = input("You: ")
     if initial_request.lower() in ["quit", "exit"]:
@@ -176,23 +155,26 @@ def main():
         end_time = time.time()
         elapsed_time = end_time - start_time
         
-        print("\n--- ✅ PROCESS COMPLETE ---", flush=True)
-        print(f"⏱️  Total execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)", flush=True)
-        print()  # Add blank line for readability
+        print("\n" + "="*60)
+        print("✅ PROCESS COMPLETE")
+        print("="*60)
+        print(f"⏱️  Time: {elapsed_time:.1f}s ({elapsed_time/60:.1f}m)\n")
         
         if not final_state.get("validation_passed"):
-            print("The process ended after multiple failed attempts.")
-            print("\nFinal Validation Report:")
+            print("❌ Failed after multiple attempts.\n")
+            print("📄 Error Report:")
+            print("-" * 60)
             print(final_state.get("validation_report", "No report available."))
+            print("-" * 60)
             break
 
-        print("\n--- 📝 FINAL CODE ---")
+        print("� GENERATED CODE")
+        print("="*60)
         for filename, code in final_state["generated_files"].items():
-            print("-" * 20)
-            print(f"📄 {filename}")
-            print("-" * 20)
+            print(f"\n📄 {filename}")
+            print("-" * 60)
             print(code)
-            print()
+        print("="*60)
         
         print("\n--- �️ SECURITY REPORT ---")
         print(final_state.get("security_report", "No security scan was performed."))
@@ -201,8 +183,8 @@ def main():
         print(final_state.get("deployment_report", "No deployment was attempted."))
 
         print("\n--- 🧑‍💻 HUMAN REVIEW ---")
-        print("What would you like to do?")
-        review = input("[S]ave Files, [R]evise, or [Q]uit? ").lower()
+        print("="*60)
+        review = input("[S]ave | [R]evise | [Q]uit: ").lower()
 
         if review == 's':
             project_name = input("Enter a directory name for this project (e.g., 's3-bucket-project'): ")

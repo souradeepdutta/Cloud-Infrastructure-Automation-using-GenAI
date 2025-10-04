@@ -1,0 +1,12 @@
+# Ignore everything by default
+*
+*/
+
+# But track these specific files
+!main.py
+!tools.py
+!docker-compose.yml
+!agents.py
+
+# Don't ignore .gitignore itself
+!.gitignore

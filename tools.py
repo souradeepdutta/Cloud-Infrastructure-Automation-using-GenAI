@@ -1,7 +1,6 @@
 # tools.py
 import subprocess
 import os
-import tempfile
 import json
 import shutil
 from langchain_core.tools import tool
@@ -149,27 +148,19 @@ def terraform_apply_tool(files: dict[str, str]) -> str:
     """
     Applies the given Terraform configuration to LocalStack.
     The dictionary keys are filenames and values are the code content.
-    Runs `init` and `apply`. Returns the `terraform apply` output.
+    Uses the same work directory that was already initialized during validation.
+    Returns the `terraform apply` output.
     """
     try:
         # Use the same work directory that was already initialized during validation
-        # This avoids re-running init and re-downloading providers
+        # No need to check or re-init - validation always runs first
         if not os.path.exists(os.path.join(WORK_DIR, ".terraform")):
-            # If .terraform doesn't exist, we need to init
-            env = os.environ.copy()
-            env.update(LOCALSTACK_ENV)
-            env["TF_PLUGIN_CACHE_DIR"] = PLUGIN_CACHE_DIR
-            env["TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE"] = "true"
-            
-            subprocess.run(
-                ["terraform", "init", "-no-color", "-input=false", "-upgrade=false"],
-                cwd=WORK_DIR, capture_output=True, text=True, check=True, env=env
-            )
+            return "Error: Terraform not initialized. Validation must be run first."
         
         env = os.environ.copy()
         env.update(LOCALSTACK_ENV)
 
-        # Run terraform apply (no need to init again, already done in validate)
+        # Run terraform apply
         apply_result = subprocess.run(
             ["terraform", "apply", "-auto-approve", "-no-color"],
             cwd=WORK_DIR, capture_output=True, text=True, check=True, env=env

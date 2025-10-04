@@ -4,8 +4,7 @@ load_dotenv()
 
 import os
 import json
-from typing import TypedDict, Annotated, List, Dict
-from langgraph.graph.message import add_messages
+from typing import TypedDict, List, Dict
 from langchain_google_genai import ChatGoogleGenerativeAI
 # Make sure 'tools.py' is in the same directory and contains the tool definitions
 from tools import terraform_validate_tool, terraform_apply_tool, terraform_security_scan_tool
@@ -25,7 +24,6 @@ class GraphState(TypedDict):
     security_report: str
     security_passed: bool
     retry_count: int
-    messages: Annotated[list, add_messages]
 
 # --- Configure LLM ---
 # Gemini 2.5 Flash with reasoning mode for better planning
@@ -34,6 +32,18 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.0,  # Maximum determinism for consistent code generation
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
+
+# --- Helper Functions ---
+
+def _create_fallback_structure(initial_request: str) -> dict:
+    """Creates a fallback plan structure when LLM response fails."""
+    return {
+        "plan": "1. Configure AWS provider\n2. Create requested resources",
+        "file_structure": [
+            {"file_name": "provider.tf", "brief": "Configure AWS provider for LocalStack with all required endpoints"},
+            {"file_name": "main.tf", "brief": f"Create all resources needed for: {initial_request}"}
+        ]
+    }
 
 # --- Agent Classes ---
 
@@ -104,42 +114,19 @@ BAD brief: "Create DynamoDB table" (too vague!)
             
             if not plan or not file_structure:
                 print("⚠️ Warning: Response missing plan or files. Using fallback.")
-                return {
-                    "plan": "1. Configure provider\n2. Create main resources",
-                    "file_structure": [
-                        {"file_name": "provider.tf", "brief": "Configure AWS provider for LocalStack"},
-                        {"file_name": "main.tf", "brief": f"Create resources for: {state['initial_request']}"}
-                    ],
-                    "generated_files": {},
-                    "validation_report": "",
-                    "security_report": ""
-                }
+                return _create_fallback_structure(state['initial_request'])
             
             print(f"✅ Plan created: {len(file_structure)} files to generate")
             
-            # Reset state for the new plan
             return {
                 "plan": plan,
-                "file_structure": file_structure,
-                "generated_files": {},
-                "validation_report": "",
-                "security_report": ""
+                "file_structure": file_structure
             }
             
         except json.JSONDecodeError as e:
             print(f"❌ ERROR: PlannerArchitect did not return valid JSON: {e}")
             print(f"Response was: {response.content[:500]}")
-            # Provide fallback structure
-            return {
-                "plan": "1. Configure AWS provider\n2. Create requested resources",
-                "file_structure": [
-                    {"file_name": "provider.tf", "brief": "Configure AWS provider for LocalStack with all required endpoints"},
-                    {"file_name": "main.tf", "brief": f"Create all resources needed for: {state['initial_request']}"}
-                ],
-                "generated_files": {},
-                "validation_report": "",
-                "security_report": ""
-            }
+            return _create_fallback_structure(state['initial_request'])
 
 class CodeGeneratorAgent:
     """Generates HCL code for a single file based on a brief."""

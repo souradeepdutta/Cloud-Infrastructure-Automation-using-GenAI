@@ -13,6 +13,9 @@ from agents import (
     SecurityScannerAgent
 )
 
+# --- Configuration ---
+MAX_RETRIES = 3
+
 # --- Instantiate Agents ---
 planner_architect_agent = PlannerArchitectAgent()
 code_generator_agent = CodeGeneratorAgent()
@@ -24,46 +27,39 @@ deployer_agent = DeployerAgent()
 
 def generation_router(state: GraphState):
     """Determines if there are more files to generate or if it's time to validate."""
-    if state.get("file_structure") and len(state["file_structure"]) > 0:
+    if state.get("file_structure"):
         return "code_generator"
     else:
         return "code_validator"
 
 def validation_router(state: GraphState):
-    """Routes after validation. To security scanner if passed, to final_router if failed."""
+    """Routes after validation. To security scanner if passed, else use final_router logic."""
     if state.get("validation_passed"):
         return "security_scanner"
-    return "final_router"
+    # Increment retry and route
+    state["retry_count"] = state.get("retry_count", 0) + 1
+    return final_router(state)
 
 def security_router(state: GraphState):
-    """Routes after security scan. To deployer if passed, to final_router if failed."""
+    """Routes after security scan. To deployer if passed, else use final_router logic."""
     if state.get("security_passed"):
         return "deployer"
-    return "final_router"
+    # Increment retry and route
+    state["retry_count"] = state.get("retry_count", 0) + 1
+    return final_router(state)
 
 def final_router(state: GraphState):
-    """The final router node that updates state after validation failure."""
+    """Routes after failure. Retries or ends based on retry count."""
     retry_count = state.get("retry_count", 0)
     
     if state.get("human_feedback"):
-        return {}
+        return "planner_architect"
 
-    if retry_count < 3:
-        print(f"\n⚠️ Attempt {retry_count + 1} failed. Retrying with improvements...")
-        return {"retry_count": retry_count + 1}
+    if retry_count < MAX_RETRIES:
+        print(f"\n⚠️ Attempt {retry_count} failed. Retrying with improvements...")
+        return "planner_architect"
 
     print("\n❌ Maximum retries reached.")
-    return {}
-
-def final_router_condition(state: GraphState):
-    """Determines the next step after final_router node."""
-    retry_count = state.get("retry_count", 0)
-    if state.get("human_feedback"):
-        return "planner_architect"
-    
-    if retry_count < 3:
-        return "planner_architect"
-    
     return "end"
 
 # --- Build the Graph ---
@@ -74,9 +70,6 @@ workflow.add_node("code_generator", code_generator_agent.run)
 workflow.add_node("code_validator", code_validator_agent.run)
 workflow.add_node("security_scanner", security_scanner_agent.run)
 workflow.add_node("deployer", deployer_agent.run)
-# === THIS IS THE FIX ===
-# You must add the router as a node if you want to create an edge from it.
-workflow.add_node("final_router", final_router)
 
 
 workflow.set_entry_point("planner_architect")
@@ -95,7 +88,8 @@ workflow.add_conditional_edges(
     validation_router,
     {
         "security_scanner": "security_scanner",
-        "final_router": "final_router"
+        "end": END,
+        "planner_architect": "planner_architect"
     }
 )
 
@@ -104,15 +98,9 @@ workflow.add_conditional_edges(
     security_router,
     {
         "deployer": "deployer",
-        "final_router": "final_router"
+        "end": END,
+        "planner_architect": "planner_architect"
     }
-)
-
-# This edge will now work because "final_router" has been added as a node.
-workflow.add_conditional_edges(
-    "final_router",
-    final_router_condition,  # Use the separate condition function
-    {"end": END, "planner_architect": "planner_architect"}
 )
 
 # Compile the graph

@@ -19,7 +19,7 @@ MAX_RETRIES = 3
 # --- Instantiate Agents ---
 planner_architect_agent = PlannerArchitectAgent()
 code_generator_agent = CodeGeneratorAgent()
-code_validator_agent = CodeValidatorAgent()
+code_validator_agent = CodeValidatorAgent() 
 security_scanner_agent = SecurityScannerAgent()
 deployer_agent = DeployerAgent()
 

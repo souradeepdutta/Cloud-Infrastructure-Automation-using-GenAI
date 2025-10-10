@@ -26,10 +26,9 @@ class GraphState(TypedDict):
     retry_count: int
 
 # --- Configure LLM ---
-# Gemini 2.5 Flash with reasoning mode for better planning
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
-    temperature=0.0,  # Maximum determinism for consistent code generation
+    temperature=0.0,
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
 

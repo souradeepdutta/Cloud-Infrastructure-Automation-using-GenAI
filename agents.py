@@ -34,6 +34,37 @@ llm = ChatGoogleGenerativeAI(
 
 # --- Helper Functions ---
 
+def _load_security_rules():
+    """Load security rules from TFSEC_RULES.md file."""
+    try:
+        rules_file = os.path.join(os.path.dirname(__file__), "TFSEC_RULES.md")
+        with open(rules_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+            # Extract just the rules sections, not the full doc
+            lines = content.split('\n')
+            rules = []
+            capture = False
+            for line in lines:
+                if '**CRITICAL' in line or 'Constants (Always True' in line or 'Instance Type RAM' in line:
+                    capture = True
+                if capture and line.strip():
+                    rules.append(line)
+                if line.startswith('---'):
+                    break
+            return '\n'.join(rules)
+    except Exception as e:
+        print(f"⚠️ Could not load TFSEC_RULES.md: {e}")
+        # Fallback rules
+        return """
+EC2: metadata_options{http_tokens=required} + associate_public_ip_address=false + ebs_block_device{encrypted=true}
+S3: aws_s3_bucket_server_side_encryption_configuration(AES256) + aws_s3_bucket_public_access_block(all=true) + aws_s3_bucket_versioning(Enabled)
+DynamoDB: server_side_encryption{enabled=true} + point_in_time_recovery{enabled=true}
+Lambda: tracing_config{mode=Active}
+RDS: storage_encrypted=true + publicly_accessible=false + backup_retention_period>=7
+Constants: ami=ami-ff0fea8310f3, region=us-east-1, endpoint=http://localhost:4566
+RAM: 2GB=t3.small, 4GB=t3.medium, 8GB=t3.large, 16GB=t3.xlarge
+"""
+
 def _create_fallback_structure(initial_request: str) -> dict:
     """Creates a fallback plan structure when LLM response fails."""
     return {
@@ -47,66 +78,67 @@ def _create_fallback_structure(initial_request: str) -> dict:
 # --- Agent Classes ---
 
 class PlannerArchitectAgent:
-    """Creates plan AND file structure with detailed briefs in one step - eliminates information loss."""
+    """Creates plan AND file structure. Learns from validation/security errors."""
     def run(self, state: GraphState):
         print("\n🧠 Planning architecture...")
-        error_context = ""
-        # If a previous run failed, add the error report to the context for the LLM to fix.
-        if state.get("validation_report") and not state.get("validation_passed"):
-            error_context = f"""
-⚠️ PREVIOUS ERRORS TO FIX:
-{state['validation_report']}
-
-FIX BY: Simplifying the plan, ensuring security resources are separate, and being more specific in briefs.
-"""
         
-        prompt = f"""Think step-by-step to create a MINIMAL Terraform architecture.
+        # Load security rules from file
+        security_rules = _load_security_rules()
+        
+        # Build feedback from previous failures
+        feedback = ""
+        if state.get("validation_report") and not state.get("validation_passed"):
+            feedback = f"\n\n🔴 PREVIOUS VALIDATION ERRORS:\n{state['validation_report']}\n\n"
+            feedback += "👉 Analyze WHY these errors occurred and FIX them in the new plan.\n"
+            feedback += "Common fixes: Check resource names, syntax, required parameters, security configs.\n"
+        
+        if state.get("security_report") and not state.get("security_passed"):
+            feedback += f"\n\n🛡️ SECURITY SCAN FAILURES:\n{state['security_report']}\n\n"
+            feedback += "👉 These are tfsec policy violations. Review the SECURITY RULES below and ensure ALL are implemented.\n"
+        
+        if state.get('human_feedback'):
+            feedback += f"\n\n💬 USER FEEDBACK:\n{state['human_feedback']}\n"
+        
+        prompt = f"""You are an expert Terraform architect. Create infrastructure for: "{state['initial_request']}"
+{feedback}
 
-User wants: {state['initial_request']}
-{error_context}
+📋 SECURITY RULES (from tfsec - MUST implement ALL relevant ones):
+{security_rules}
 
-Reasoning process:
-1. What AWS resources are EXPLICITLY requested? (Don't add extras)
-2. What security configs are MANDATORY for these resources?
-3. What files are needed? (provider.tf always + main.tf)
+🧠 REASONING PROCESS:
+1. What AWS resources are needed? (EC2, S3, DynamoDB, Lambda, RDS, etc.)
+2. How many instances/resources? (Use `count` parameter for multiple)
+3. What specifications? (RAM → instance_type, storage size, etc.)
+4. Which security rules apply? (Check the rules above for each resource type)
+5. Are all mandatory security configurations included?
 
-🔐 SECURITY REQUIREMENTS (separate resources):
-S3: bucket + encryption_configuration(AES256) + public_access_block(all true) + versioning(Enabled)
-DynamoDB: table with server_side_encryption + point_in_time_recovery blocks
-Lambda: function + iam_role + tracing_config(Active)
-EC2: encrypted volumes + metadata_options(http_tokens=required) + no public IP
-RDS: storage_encrypted + not publicly_accessible + backup_retention >= 7
+⚡ IMPORTANT:
+- Be SPECIFIC in briefs - include actual parameter names and values
+- For EC2: Always include ami, instance_type, associate_public_ip_address, metadata_options, ebs_block_device
+- For S3: Create SEPARATE resources for encryption, public_access_block, and versioning
+- Use count parameter for multiple identical resources
 
-⚠️ KEEP IT SIMPLE:
-- NO variables.tf or outputs.tf unless explicitly requested
-- NO KMS keys (use AES256)
-- NO log buckets (unless asked)
-- 3-4 steps max in plan
-
-OUTPUT JSON:
+OUTPUT VALID JSON:
 {{
-  "plan": "1. Setup provider\\n2. Create [resource]\\n3. Add security configs",
+  "plan": "1. Configure LocalStack provider\\n2. Create X [resources] with Y [specs]\\n3. Apply security configurations\\n4. Add appropriate tags",
   "files": [
-    {{"file_name": "provider.tf", "brief": "AWS provider for LocalStack: region us-east-1, test creds, endpoints http://localhost:4566"}},
-    {{"file_name": "main.tf", "brief": "Resource-by-resource list: aws_s3_bucket 'my_bucket' bucket='name', aws_s3_bucket_server_side_encryption_configuration sse_algorithm=AES256, aws_s3_bucket_public_access_block all=true, aws_s3_bucket_versioning status=Enabled"}}
+    {{"file_name": "provider.tf", "brief": "AWS provider configuration: region=us-east-1, access_key=test, secret_key=test, skip_credentials_validation=true, skip_metadata_api_check=true, skip_requesting_account_id=true, s3_use_path_style=true, endpoints for all services=http://localhost:4566"}},
+    {{"file_name": "main.tf", "brief": "Detailed resource list: aws_instance resource_name count=5 ami=ami-ff0fea8310f3 instance_type=t3.large associate_public_ip_address=false metadata_options{{http_tokens=required}} ebs_block_device{{device_name=/dev/sda1 volume_size=30 encrypted=true}} tags{{Name=instance-${{count.index+1}}}}"}}
   ]
 }}
-
-GOOD brief: "aws_dynamodb_table 'users' hash_key='id':S billing_mode=PAY_PER_REQUEST server_side_encryption enabled=true point_in_time_recovery enabled=true"
-BAD brief: "Create DynamoDB table" (too vague!)
 """
         
-        # Add human feedback if provided
-        if state.get('human_feedback'):
-            prompt += f"\n\nHuman feedback: {state['human_feedback']}"
-        
         response = llm.invoke(prompt)
-        # Debug output hidden for cleaner console
         
         try:
-            # Clean up potential markdown formatting
-            cleaned_response = response.content.strip().replace("```json", "").replace("```", "")
-            parsed = json.loads(cleaned_response)
+            # Clean up markdown formatting
+            cleaned_response = response.content.strip()
+            if "```json" in cleaned_response:
+                cleaned_response = cleaned_response.split("```json")[1].split("```")[0]
+            elif "```" in cleaned_response:
+                cleaned_response = cleaned_response.replace("```", "")
+            
+            parsed = json.loads(cleaned_response.strip())
             
             plan = parsed.get("plan", "")
             file_structure = parsed.get("files", [])
@@ -128,7 +160,7 @@ BAD brief: "Create DynamoDB table" (too vague!)
             return _create_fallback_structure(state['initial_request'])
 
 class CodeGeneratorAgent:
-    """Generates HCL code for a single file based on a brief."""
+    """Generates HCL code for a single file based on a detailed brief."""
     def run(self, state: GraphState):
         files_to_generate = state["file_structure"]
         if not files_to_generate:
@@ -140,60 +172,51 @@ class CodeGeneratorAgent:
         brief = current_file_spec["brief"]
 
         print(f"\n💻 Generating {file_name}...")
-        prompt = f"""Generate HCL code for {file_name}. Output ONLY code, no explanations.
-
-Brief: {brief}
-
-RULES:
-- Follow the brief exactly
-- For provider.tf: LocalStack endpoints (us-east-1, test creds, http://localhost:4566)
-- Use .id for resource references (e.g., aws_s3_bucket.name.id)
-- Keep code clean and minimal
-
-**Correct `provider.tf` for LocalStack:**
-```hcl
-terraform {{
-  required_providers {{
-    aws = {{
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }}
-  }}
-}}
-
-# Configure the AWS provider to target LocalStack
-provider "aws" {{
-  region                      = "us-east-1"
-  access_key                  = "test"
-  secret_key                  = "test"
-  skip_credentials_validation = true
-  skip_metadata_api_check     = true
-  skip_requesting_account_id  = true
-  s3_use_path_style           = true # Required for S3 in some versions
-
-  # Define endpoints for all services to be used
-  endpoints {{
-    s3           = "http://localhost:4566"
-    lambda       = "http://localhost:4566"
-    dynamodb     = "http://localhost:4566"
-    apigateway   = "http://localhost:4566"
-    iam          = "http://localhost:4566"
-    sts          = "http://localhost:4566"
-    sqs          = "http://localhost:4566"
-    sns          = "http://localhost:4566"
-    # Add other services here as needed, all pointing to http://localhost:4566
-  }}
-}}
-```
-
-Now, generate the complete and correct HCL code for the file: {file_name}.
-"""
-        response = llm.invoke(prompt)
-        # Clean up markdown formatting
-        generated_code = response.content.strip().replace("```hcl", "").replace("```", "")
-        print(f"✓ Generated {file_name}")
         
-        # Generated code
+        # Load security rules for reference
+        security_rules = _load_security_rules()
+        
+        prompt = f"""Generate complete, valid HCL (Terraform) code for: {file_name}
+
+📝 BRIEF (follow exactly):
+{brief}
+
+🔐 SECURITY RULES (ensure compliance):
+{security_rules}
+
+⚡ CRITICAL REQUIREMENTS:
+- Output ONLY valid HCL code, no explanations or markdown
+- Follow the brief specifications exactly
+- Include ALL security configurations mentioned in brief
+- Use proper HCL syntax with correct block structure
+- For provider.tf: Include ALL service endpoints pointing to http://localhost:4566
+- For main.tf: Include complete resource blocks with all required and security parameters
+
+📌 CONSTANTS (always use these):
+- AMI for EC2: ami-ff0fea8310f3
+- Region: us-east-1
+- LocalStack endpoint: http://localhost:4566
+- Credentials: access_key="test", secret_key="test"
+
+Generate the complete, valid HCL code now:
+"""
+        
+        response = llm.invoke(prompt)
+        
+        # Clean up markdown formatting
+        generated_code = response.content.strip()
+        if "```hcl" in generated_code:
+            generated_code = generated_code.split("```hcl")[1].split("```")[0]
+        elif "```terraform" in generated_code:
+            generated_code = generated_code.split("```terraform")[1].split("```")[0]
+        elif "```" in generated_code:
+            # Remove any remaining markdown code fences
+            generated_code = generated_code.replace("```", "")
+        
+        generated_code = generated_code.strip()
+        print(f"✓ Generated {file_name} ({len(generated_code)} bytes)")
+        
+        # Store generated code
         updated_files = state.get("generated_files", {})
         updated_files[file_name] = generated_code
         

@@ -160,9 +160,10 @@ def terraform_apply_tool(files: dict[str, str]) -> str:
         env = os.environ.copy()
         env.update(LOCALSTACK_ENV)
 
-        # Run terraform apply
+        # Run terraform apply with -parallelism=1 for better LocalStack compatibility
+        # LocalStack can have issues with highly parallel operations, especially for EC2
         apply_result = subprocess.run(
-            ["terraform", "apply", "-auto-approve", "-no-color"],
+            ["terraform", "apply", "-auto-approve", "-no-color", "-parallelism=1"],
             cwd=WORK_DIR, capture_output=True, text=True, check=True, env=env
         )
 

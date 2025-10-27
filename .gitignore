@@ -7,6 +7,9 @@
 !tools.py
 !docker-compose.yml
 !agents.py
+!streamlit_app.py
+!TFSEC_RULES.md
+!TFSEC_SECURITY_POLICIES.md
 
 # Don't ignore .gitignore itself
 !.gitignore

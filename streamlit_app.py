@@ -1,21 +1,34 @@
 # streamlit_app.py
-import streamlit as st
-import uuid
+import logging
 import os
 import time
-from langgraph.graph import StateGraph, END
+import uuid
+from typing import Any, Dict, Optional, Tuple
+
+import streamlit as st
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+
 from agents import (
-    GraphState,
-    PlannerArchitectAgent,
     CodeGeneratorAgent,
     CodeValidatorAgent,
     DeployerAgent,
-    SecurityScannerAgent
+    GraphState,
+    PlannerArchitectAgent,
+    SecurityScannerAgent,
 )
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 MAX_RETRIES = 3
+PROGRESS_STEP = 15  # Progress bar increment per step
+MAX_PROGRESS = 90   # Maximum progress before completion
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -207,40 +220,34 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Initialize Session State ---
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
-    st.session_state.config = {"configurable": {"thread_id": st.session_state.thread_id}}
+def initialize_session_state():
+    """Initialize all session state variables with default values."""
+    defaults = {
+        "thread_id": str(uuid.uuid4()),
+        "generated_files": {},
+        "validation_passed": False,
+        "security_passed": False,
+        "validation_report": "",
+        "security_report": "",
+        "deployment_report": "",
+        "process_complete": False,
+        "elapsed_time": 0,
+        "plan": "",
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    
+    # Set config after thread_id is initialized
+    if "config" not in st.session_state:
+        st.session_state.config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
-if "generated_files" not in st.session_state:
-    st.session_state.generated_files = {}
-
-if "validation_passed" not in st.session_state:
-    st.session_state.validation_passed = False
-
-if "security_passed" not in st.session_state:
-    st.session_state.security_passed = False
-
-if "validation_report" not in st.session_state:
-    st.session_state.validation_report = ""
-
-if "security_report" not in st.session_state:
-    st.session_state.security_report = ""
-
-if "deployment_report" not in st.session_state:
-    st.session_state.deployment_report = ""
-
-if "process_complete" not in st.session_state:
-    st.session_state.process_complete = False
-
-if "elapsed_time" not in st.session_state:
-    st.session_state.elapsed_time = 0
-
-if "plan" not in st.session_state:
-    st.session_state.plan = ""
+initialize_session_state()
 
 # --- Test Mode Function ---
 def load_test_data():
-    """Load mock data for UI testing without running the full pipeline"""
+    """Load mock data for UI testing without running the full pipeline."""
     st.session_state.generated_files = {
         "main.tf": '''resource "aws_s3_bucket" "user_uploads" {
   bucket = "user-uploads-bucket"
@@ -299,6 +306,7 @@ bucket_arn = "arn:aws:s3:::user-uploads-bucket"
 3. Configure LocalStack provider
 4. Add appropriate tags"""
 
+
 # --- Instantiate Agents ---
 @st.cache_resource
 def get_agents():
@@ -315,50 +323,56 @@ agents = get_agents()
 # --- Build the Graph ---
 @st.cache_resource
 def build_workflow():
-    def generation_router(state: GraphState):
+    """Build the LangGraph workflow with all agent nodes and routing logic."""
+    
+    def code_generation_router(state: GraphState):
+        """Route code generator: loop until all files generated, then validate."""
         if state.get("file_structure"):
             return "code_generator"
-        else:
-            return "code_validator"
-
+        return "code_validator"
+    
     def validation_router(state: GraphState):
+        """Route after validation: to security scanner or retry/end."""
         if state.get("validation_passed"):
             return "security_scanner"
-        state["retry_count"] = state.get("retry_count", 0) + 1
-        return final_router(state)
+        # Don't mutate state here - routers should be pure functions
+        return _retry_or_end_router(state)
 
     def security_router(state: GraphState):
+        """Route after security scan: to deployer or retry/end."""
         if state.get("security_passed"):
             return "deployer"
-        state["retry_count"] = state.get("retry_count", 0) + 1
-        return final_router(state)
+        # Don't mutate state here - routers should be pure functions
+        return _retry_or_end_router(state)
 
-    def final_router(state: GraphState):
+    def _retry_or_end_router(state: GraphState):
+        """Determine whether to retry or end based on retry count and feedback."""
         retry_count = state.get("retry_count", 0)
-        if state.get("human_feedback"):
-            return "planner_architect"
-        if retry_count < MAX_RETRIES:
+        if state.get("human_feedback") or retry_count < MAX_RETRIES:
             return "planner_architect"
         return "end"
 
     workflow = StateGraph(GraphState)
     
+    # Add all agent nodes
     workflow.add_node("planner_architect", agents["planner"].run)
     workflow.add_node("code_generator", agents["generator"].run)
     workflow.add_node("code_validator", agents["validator"].run)
     workflow.add_node("security_scanner", agents["security"].run)
     workflow.add_node("deployer", agents["deployer"].run)
 
+    # Set entry point and simple edges
     workflow.set_entry_point("planner_architect")
     workflow.add_edge("planner_architect", "code_generator")
     workflow.add_edge("deployer", END)
 
+    # Add conditional routing edges
     workflow.add_conditional_edges(
         "code_generator",
-        generation_router,
+        code_generation_router,
         {"code_generator": "code_generator", "code_validator": "code_validator"}
     )
-
+    
     workflow.add_conditional_edges(
         "code_validator",
         validation_router,
@@ -383,6 +397,7 @@ def build_workflow():
     return workflow.compile(checkpointer=memory)
 
 app = build_workflow()
+
 
 # --- UI Layout ---
 st.markdown('<div class="main-header">AWS Infrastructure Generator</div>', unsafe_allow_html=True)
@@ -415,9 +430,113 @@ with st.sidebar:
         st.rerun()
     
     if st.button("🔄 Reset Session", use_container_width=True):
+        # Clear all session state
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
+
+
+# --- Helper Functions for Processing ---
+def update_progress_status(final_state: Optional[Dict[str, Any]], status_text: Any) -> None:
+    """Update status text based on current workflow state."""
+    if not final_state:
+        return
+        
+    if final_state.get("plan"):
+        status_text.text("💻 Generating code...")
+    elif final_state.get("generated_files"):
+        status_text.text("🔍 Validating code...")
+    elif final_state.get("validation_passed"):
+        status_text.text("🛡️ Running security scan...")
+    elif final_state.get("security_passed"):
+        status_text.text("🚀 Deploying to LocalStack...")
+
+
+def run_workflow_with_progress(inputs: Dict[str, Any], is_revision: bool = False) -> Tuple[Optional[Dict[str, Any]], float]:
+    """
+    Execute the workflow and update progress bar.
+    
+    Args:
+        inputs: Input dictionary for the workflow
+        is_revision: Whether this is a revision request
+        
+    Returns:
+        tuple: (final_state, elapsed_time) or (None, 0) on error
+    """
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    initial_message = "🔄 Processing revision..." if is_revision else "🧠 Planning architecture..."
+    status_text.text(initial_message)
+    progress_bar.progress(10)
+    
+    start_time = time.time()
+    
+    try:
+        events = app.stream(inputs, st.session_state.config, stream_mode="values")
+        final_state = None
+        
+        step = 0
+        for event in events:
+            final_state = event
+            step += 1
+            progress = min(10 + (step * PROGRESS_STEP), MAX_PROGRESS)
+            progress_bar.progress(progress)
+            update_progress_status(final_state, status_text)
+        
+        elapsed_time = time.time() - start_time
+        
+        progress_bar.progress(100)
+        completion_message = "✅ Revision complete!" if is_revision else "✅ Process complete!"
+        status_text.text(completion_message)
+        
+        time.sleep(1)
+        return final_state, elapsed_time
+        
+    except Exception as e:
+        logger.exception("Workflow execution failed")
+        status_text.text("❌ Error occurred!")
+        st.error(f"An error occurred: {type(e).__name__}: {str(e)}")
+        progress_bar.empty()
+        return None, 0
+
+
+def update_session_state_from_workflow(final_state: Optional[Dict[str, Any]], elapsed_time: float) -> None:
+    """Update session state with workflow results."""
+    if final_state:
+        st.session_state.generated_files = final_state.get("generated_files", {})
+        st.session_state.validation_passed = final_state.get("validation_passed", False)
+        st.session_state.security_passed = final_state.get("security_passed", False)
+        st.session_state.validation_report = final_state.get("validation_report", "")
+        st.session_state.security_report = final_state.get("security_report", "")
+        st.session_state.deployment_report = final_state.get("deployment_report", "")
+        st.session_state.plan = final_state.get("plan", "")
+        st.session_state.process_complete = True
+        st.session_state.elapsed_time = elapsed_time
+
+
+def save_files_to_disk(project_name: str, files: Dict[str, str]) -> bool:
+    """
+    Save generated files to a project directory.
+    
+    Args:
+        project_name: Name of the project directory
+        files: Dictionary of filename -> content
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        os.makedirs(project_name, exist_ok=True)
+        for filename, code in files.items():
+            filepath = os.path.join(project_name, filename)
+            with open(filepath, "w") as f:
+                f.write(code)
+        return True
+    except Exception as e:
+        st.error(f"❌ Error saving files: {e}")
+        return False
+
 
 # --- Main Content ---
 tab1, tab2, tab3 = st.tabs(["📝 Generate", "📄 Code", "📊 Reports"])
@@ -433,17 +552,13 @@ with tab1:
         label_visibility="collapsed"
     )
     
-    # Center the generate button with minimal width
+    # Center the generate button
     col1, col2, col3 = st.columns([2, 1, 2])
-    
     with col2:
         generate_btn = st.button("Generate Infrastructure", type="primary", use_container_width=True)
     
-    # Revise button (shown after generation)
-    if st.session_state.process_complete:
-        revise_btn = st.button("✏️ Revise", use_container_width=True)
-    else:
-        revise_btn = False
+    # Show revise button after generation
+    revise_btn = st.button("✏️ Revise", use_container_width=True) if st.session_state.process_complete else False
     
     # --- Process Generation ---
     if generate_btn and user_input:
@@ -455,59 +570,13 @@ with tab1:
             "retry_count": 0,
         }
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        start_time = time.time()
-        
-        try:
-            status_text.text("🧠 Planning architecture...")
-            progress_bar.progress(10)
-            
-            events = app.stream(inputs, st.session_state.config, stream_mode="values")
-            final_state = None
-            
-            step = 0
-            for event in events:
-                final_state = event
-                step += 1
-                progress = min(10 + (step * 15), 90)
-                progress_bar.progress(progress)
-                
-                # Update status based on the current state
-                if final_state.get("plan"):
-                    status_text.text("💻 Generating code...")
-                if final_state.get("generated_files"):
-                    status_text.text("🔍 Validating code...")
-                if final_state.get("validation_passed"):
-                    status_text.text("🛡️ Running security scan...")
-                if final_state.get("security_passed"):
-                    status_text.text("🚀 Deploying to LocalStack...")
-            
-            end_time = time.time()
-            st.session_state.elapsed_time = end_time - start_time
-            
-            progress_bar.progress(100)
-            status_text.text("✅ Process complete!")
-            
-            # Update session state with results
-            if final_state:
-                st.session_state.generated_files = final_state.get("generated_files", {})
-                st.session_state.validation_passed = final_state.get("validation_passed", False)
-                st.session_state.security_passed = final_state.get("security_passed", False)
-                st.session_state.validation_report = final_state.get("validation_report", "")
-                st.session_state.security_report = final_state.get("security_report", "")
-                st.session_state.deployment_report = final_state.get("deployment_report", "")
-                st.session_state.plan = final_state.get("plan", "")
-                st.session_state.process_complete = True
-            
-            time.sleep(1)
+        final_state, elapsed_time = run_workflow_with_progress(inputs)
+        if final_state is not None:
+            update_session_state_from_workflow(final_state, elapsed_time)
             st.rerun()
-            
-        except Exception as e:
-            status_text.text("❌ Error occurred!")
-            st.error(f"An error occurred: {str(e)}")
-            progress_bar.empty()
+        else:
+            st.session_state.process_complete = False
+            st.warning("Workflow failed. Please try again or revise your request.")
     
     # --- Process Revision ---
     if revise_btn:
@@ -515,87 +584,43 @@ with tab1:
         if st.button("Submit Revision") and feedback:
             st.session_state.process_complete = False
             
-            inputs = {
-                "human_feedback": feedback,
-            }
+            inputs = {"human_feedback": feedback}
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            start_time = time.time()
-            
-            try:
-                status_text.text("🔄 Processing revision...")
-                progress_bar.progress(10)
-                
-                events = app.stream(inputs, st.session_state.config, stream_mode="values")
-                final_state = None
-                
-                step = 0
-                for event in events:
-                    final_state = event
-                    step += 1
-                    progress = min(10 + (step * 15), 90)
-                    progress_bar.progress(progress)
-                
-                end_time = time.time()
-                st.session_state.elapsed_time = end_time - start_time
-                
-                progress_bar.progress(100)
-                status_text.text("✅ Revision complete!")
-                
-                # Update session state
-                if final_state:
-                    st.session_state.generated_files = final_state.get("generated_files", {})
-                    st.session_state.validation_passed = final_state.get("validation_passed", False)
-                    st.session_state.security_passed = final_state.get("security_passed", False)
-                    st.session_state.validation_report = final_state.get("validation_report", "")
-                    st.session_state.security_report = final_state.get("security_report", "")
-                    st.session_state.deployment_report = final_state.get("deployment_report", "")
-                    st.session_state.plan = final_state.get("plan", "")
-                    st.session_state.process_complete = True
-                
-                time.sleep(1)
+            final_state, elapsed_time = run_workflow_with_progress(inputs, is_revision=True)
+            if final_state is not None:
+                update_session_state_from_workflow(final_state, elapsed_time)
                 st.rerun()
-                
-            except Exception as e:
-                status_text.text("❌ Error occurred!")
-                st.error(f"An error occurred: {str(e)}")
-                progress_bar.empty()
+            else:
+                st.session_state.process_complete = False
+                st.warning("Revision failed. Please try again with different feedback.")
     
     # --- Display Results ---
     if st.session_state.process_complete:
         st.divider()
         
+        # Metrics row
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.metric("⏱️ Time Taken", f"{st.session_state.elapsed_time:.1f}s")
         
         with col2:
-            if st.session_state.validation_passed:
-                st.metric("🔍 Validation", "✅ Passed")
-            else:
-                st.metric("🔍 Validation", "❌ Failed")
+            validation_status = "✅ Passed" if st.session_state.validation_passed else "❌ Failed"
+            st.metric("🔍 Validation", validation_status)
         
         with col3:
-            if st.session_state.security_passed:
-                st.metric("🛡️ Security", "✅ Passed")
-            else:
-                st.metric("🛡️ Security", "❌ Failed")
+            security_status = "✅ Passed" if st.session_state.security_passed else "❌ Failed"
+            st.metric("🛡️ Security", security_status)
         
-        # Plan display
+        # Display architecture plan
         if st.session_state.plan:
-            
             st.subheader("📋 Architecture Plan")
-            
             st.markdown(f"```\n{st.session_state.plan}\n```")
         
         # Save option
         if st.session_state.validation_passed:
             st.divider()
-            
             st.subheader("💾 Save Generated Files")
-            
             
             project_name = st.text_input(
                 "Project directory name:",
@@ -604,14 +629,9 @@ with tab1:
             )
             
             if st.button("💾 Save to Disk", use_container_width=True):
-                try:
-                    os.makedirs(project_name, exist_ok=True)
-                    for filename, code in st.session_state.generated_files.items():
-                        with open(os.path.join(project_name, filename), "w") as f:
-                            f.write(code)
+                if save_files_to_disk(project_name, st.session_state.generated_files):
                     st.success(f"✨ Files saved to './{project_name}/'")
-                except Exception as e:
-                    st.error(f"❌ Error saving files: {e}")
+
 
 with tab2:
     st.subheader("📄 Generated Terraform Code")
@@ -627,25 +647,22 @@ with tab2:
 with tab3:
     st.subheader("📊 Validation & Security Reports")
     st.markdown('<div style="margin-top: 0.5rem;"></div>', unsafe_allow_html=True)
+    
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("#### 🔍 Validation Report")
         if st.session_state.validation_report:
-            if st.session_state.validation_passed:
-                st.markdown(f'<div class="success-box">{st.session_state.validation_report}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="error-box">{st.session_state.validation_report}</div>', unsafe_allow_html=True)
+            css_class = "success-box" if st.session_state.validation_passed else "error-box"
+            st.markdown(f'<div class="{css_class}">{st.session_state.validation_report}</div>', unsafe_allow_html=True)
         else:
             st.info("No validation report available.")
     
     with col2:
         st.markdown("#### 🛡️ Security Report")
         if st.session_state.security_report:
-            if st.session_state.security_passed:
-                st.markdown(f'<div class="success-box">{st.session_state.security_report}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="error-box">{st.session_state.security_report}</div>', unsafe_allow_html=True)
+            css_class = "success-box" if st.session_state.security_passed else "error-box"
+            st.markdown(f'<div class="{css_class}">{st.session_state.security_report}</div>', unsafe_allow_html=True)
         else:
             st.info("No security report available.")
     
@@ -656,4 +673,5 @@ with tab3:
         st.markdown(f'<div class="info-box"><pre>{st.session_state.deployment_report}</pre></div>', unsafe_allow_html=True)
     else:
         st.info("No deployment report available.")
+
 

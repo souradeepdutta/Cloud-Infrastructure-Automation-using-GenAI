@@ -36,16 +36,14 @@ def validation_router(state: GraphState):
     """Routes after validation. To security scanner if passed, else use final_router logic."""
     if state.get("validation_passed"):
         return "security_scanner"
-    # Increment retry and route
-    state["retry_count"] = state.get("retry_count", 0) + 1
+    # Don't mutate state here - let planner agent handle retry count
     return final_router(state)
 
 def security_router(state: GraphState):
     """Routes after security scan. To deployer if passed, else use final_router logic."""
     if state.get("security_passed"):
         return "deployer"
-    # Increment retry and route
-    state["retry_count"] = state.get("retry_count", 0) + 1
+    # Don't mutate state here - let planner agent handle retry count
     return final_router(state)
 
 def final_router(state: GraphState):

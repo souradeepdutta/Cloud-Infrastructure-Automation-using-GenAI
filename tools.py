@@ -1,136 +1,227 @@
 # tools.py
-import subprocess
-import os
 import json
+import logging
+import os
 import shutil
+import subprocess
+from typing import Dict
+
 from langchain_core.tools import tool
 
-# --- Environment Setup for LocalStack ---
-# These variables tell the AWS provider to target your local LocalStack instance.
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
+# --- Constants ---
 LOCALSTACK_ENV = {
     "AWS_ACCESS_KEY_ID": "test",
     "AWS_SECRET_ACCESS_KEY": "test",
     "AWS_DEFAULT_REGION": "us-east-1",
 }
 
-# Create a persistent plugin cache directory to avoid re-downloading providers
-PLUGIN_CACHE_DIR = os.path.join(os.path.dirname(__file__), "terraform_plugin_cache")
-os.makedirs(PLUGIN_CACHE_DIR, exist_ok=True)
+# Success indicators for tool responses
+class ToolResponseMessages:
+    """Constants for tool response messages to avoid magic strings."""
+    VALIDATION_SUCCESS = "Validation successful"
+    SECURITY_SUCCESS = "No security issues detected"
+    VALIDATION_PREFIX = "Formatted Files JSON:"
 
-# Create a persistent working directory for terraform operations
+# Persistent directories for Terraform operations
+PLUGIN_CACHE_DIR = os.path.join(os.path.dirname(__file__), "terraform_plugin_cache")
 WORK_DIR = os.path.join(os.path.dirname(__file__), "terraform_work")
+
+# Ensure directories exist
+os.makedirs(PLUGIN_CACHE_DIR, exist_ok=True)
 os.makedirs(WORK_DIR, exist_ok=True)
 
-@tool
-def terraform_validate_tool(files: dict[str, str]) -> str:
+
+# --- Helper Functions ---
+
+def _prepare_work_directory(files: Dict[str, str]) -> None:
     """
-    Validates and formats a dictionary of Terraform files against LocalStack.
-    The dictionary keys are filenames (e.g., 'main.tf') and values are the code content.
-    Saves the files to a directory, runs `init`, `validate`, and `fmt`.
-    Returns a JSON string of formatted files if successful, or a detailed error message.
+    Prepare work directory by clearing it and writing new files.
+    
+    Args:
+        files: Dictionary of filename -> content to write
+    """
+    # Clear and recreate work directory
+    if os.path.exists(WORK_DIR):
+        shutil.rmtree(WORK_DIR)
+    os.makedirs(WORK_DIR, exist_ok=True)
+    
+    # Write all files to work directory
+    for filename, content in files.items():
+        filepath = os.path.join(WORK_DIR, filename)
+        with open(filepath, "w") as f:
+            f.write(content)
+
+
+def _get_terraform_env() -> dict:
+    """
+    Get environment variables for Terraform execution.
+    
+    Returns:
+        Dictionary with environment variables including LocalStack config
+    """
+    env = os.environ.copy()
+    env.update(LOCALSTACK_ENV)
+    env["TF_PLUGIN_CACHE_DIR"] = PLUGIN_CACHE_DIR
+    env["TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE"] = "true"
+    return env
+
+
+def _run_terraform_command(args: list, env: dict = None) -> subprocess.CompletedProcess:
+    """
+    Run a Terraform command in the work directory.
+    
+    Args:
+        args: Command arguments (e.g., ["init", "-no-color"])
+        env: Environment variables (uses _get_terraform_env() if None)
+        
+    Returns:
+        CompletedProcess result
+        
+    Raises:
+        subprocess.CalledProcessError: If command fails
+    """
+    if env is None:
+        env = _get_terraform_env()
+    
+    return subprocess.run(
+        ["terraform"] + args,
+        cwd=WORK_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env
+    )
+
+
+def _format_error_message(error: subprocess.CalledProcessError) -> str:
+    """
+    Format a CalledProcessError into a readable error message.
+    
+    Args:
+        error: The subprocess error
+        
+    Returns:
+        Formatted error string
+    """
+    return (
+        f"Terraform command failed.\n"
+        f"Command: '{' '.join(error.cmd)}'\n"
+        f"Stderr: {error.stderr}\n"
+        f"Stdout: {error.stdout}"
+    )
+
+
+# --- Terraform Tools ---
+
+@tool
+def terraform_validate_tool(files: Dict[str, str]) -> str:
+    """
+    Validate and format Terraform files against LocalStack.
+    
+    Runs terraform init, validate, and fmt on the provided files.
+    
+    Args:
+        files: Dictionary of filename -> content (e.g., {'main.tf': '...'})
+        
+    Returns:
+        Success message with formatted files JSON, or detailed error message
     """
     try:
-        # Clear the work directory before starting
-        if os.path.exists(WORK_DIR):
-            shutil.rmtree(WORK_DIR)
-        os.makedirs(WORK_DIR, exist_ok=True)
+        _prepare_work_directory(files)
+        env = _get_terraform_env()
         
-        # Write files to persistent work directory
-        for filename, content in files.items():
-            with open(os.path.join(WORK_DIR, filename), "w") as f:
-                f.write(content)
-
-        # The environment variables are passed to the subprocess
-        env = os.environ.copy()
-        env.update(LOCALSTACK_ENV)
-        # Use plugin cache to avoid re-downloading providers
-        env["TF_PLUGIN_CACHE_DIR"] = PLUGIN_CACHE_DIR
-        # Disable plugin discovery to force using cache
-        env["TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE"] = "true"
-
-        # Run terraform init with flags to prevent internet access
-        subprocess.run(
-            ["terraform", "init", "-no-color", "-input=false", "-upgrade=false", "-get=true"],
-            cwd=WORK_DIR, capture_output=True, text=True, check=True, env=env
+        # Initialize Terraform (using cached providers)
+        _run_terraform_command(
+            ["init", "-no-color", "-input=false", "-upgrade=false", "-get=true"],
+            env
         )
-
-        # Run terraform validate
-        subprocess.run(
-            ["terraform", "validate", "-no-color"],
-            cwd=WORK_DIR, capture_output=True, text=True, check=True, env=env
-        )
-
-        # Run terraform fmt
-        subprocess.run(
-            ["terraform", "fmt", "-recursive"],
-            cwd=WORK_DIR, capture_output=True, text=True, check=True
-        )
-
+        
+        # Validate syntax
+        _run_terraform_command(["validate", "-no-color"], env)
+        
+        # Format code
+        _run_terraform_command(["fmt", "-recursive"])
+        
+        # Read formatted files
         formatted_files = {}
         for filename in files.keys():
-            with open(os.path.join(WORK_DIR, filename), 'r') as f:
+            filepath = os.path.join(WORK_DIR, filename)
+            with open(filepath, 'r') as f:
                 formatted_files[filename] = f.read()
-
+        
         return (
-            f"Validation successful. Code is syntactically correct and well-formed.\n\n"
-            f"Formatted Files JSON:\n{json.dumps(formatted_files, indent=2)}"
+            f"{ToolResponseMessages.VALIDATION_SUCCESS}. Code is syntactically correct and well-formed.\n\n"
+            f"{ToolResponseMessages.VALIDATION_PREFIX}\n{json.dumps(formatted_files, indent=2)}"
         )
 
     except subprocess.CalledProcessError as e:
-        error_message = (
-            f"Terraform command failed.\n"
-            f"Command: '{' '.join(e.cmd)}'\n"
-            f"Stderr: {e.stderr}\n"
-            f"Stdout: {e.stdout}"
-        )
-        return error_message
+        logger.error(f"Terraform validation command failed: {e.cmd}", exc_info=True)
+        return _format_error_message(e)
+    except FileNotFoundError as e:
+        logger.error(f"Terraform executable not found: {e}")
+        return f"Error: Terraform executable not found. Please ensure Terraform is installed and in PATH."
+    except PermissionError as e:
+        logger.error(f"Permission denied during validation: {e}")
+        return f"Error: Permission denied. Please check file/directory permissions."
     except Exception as e:
+        logger.exception("Unexpected error during terraform validation")
         return f"An unexpected error occurred: {str(e)}"
 
+
 @tool
-def terraform_security_scan_tool(files: dict[str, str]) -> str:
+def terraform_security_scan_tool(files: Dict[str, str]) -> str:
     """
-    Scans a dictionary of Terraform files for security issues using tfsec.
-    The dictionary keys are filenames and values are the code content.
-    Uses the same WORK_DIR where validation was performed to avoid redundant operations.
-    Returns a success message if no issues are found, or a detailed report of the issues.
+    Scan Terraform files for security issues using tfsec.
+    
+    Scans files in the work directory that was prepared during validation.
+    
+    Args:
+        files: Dictionary of filename -> content (used for validation check)
+        
+    Returns:
+        Success message if no issues found, or detailed security report
     """
     try:
-        # Use the same work directory where validation was already performed
-        # This ensures we scan the exact files that were validated
         if not os.path.exists(WORK_DIR):
             return "Error: Work directory not found. Please run validation first."
         
-        # Run tfsec and capture the output.
-        # tfsec exits with 0 if no problems are found.
-        # It exits with a non-zero code if issues are detected.
-        # 
-        # Using --minimum-severity HIGH to only fail on HIGH and CRITICAL issues
-        # Excluding specific checks that are not practical for LocalStack development:
-        # - aws-s3-encryption-customer-key: Requires KMS keys which adds complexity for simple buckets
-        # - aws-s3-enable-bucket-logging: Logging buckets can't log to themselves (chicken-egg problem)
+        # Run tfsec with high severity threshold and practical exclusions
+        # Excluded checks:
+        # - aws-s3-encryption-customer-key: KMS adds complexity for simple buckets
+        # - aws-s3-enable-bucket-logging: Logging buckets can't log to themselves
         scan_result = subprocess.run(
-            ["tfsec", ".", "--no-color", "--format", "default", 
-             "--minimum-severity", "HIGH",
-             "--exclude", "aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging"],
-            cwd=WORK_DIR, capture_output=True, text=True
+            [
+                "tfsec", ".",
+                "--no-color",
+                "--format", "default",
+                "--minimum-severity", "HIGH",
+                "--exclude", "aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging"
+            ],
+            cwd=WORK_DIR,
+            capture_output=True,
+            text=True
         )
 
-        # If no output and successful return code, all is well
-        # tfsec exits with 0 when no problems detected (even if it prints summary stats)
+        # tfsec exits with 0 when no problems are detected
         if scan_result.returncode == 0:
-            return "Security scan passed. No security issues detected by tfsec."
+            return f"Security scan passed. {ToolResponseMessages.SECURITY_SUCCESS} by tfsec."
         
-        # Build a comprehensive report
-        report = "Security scan detected issues.\n\n"
+        # Build comprehensive security report
+        report_parts = ["Security scan detected issues.\n"]
+        
         if scan_result.stdout:
-            report += f"tfsec Report:\n{scan_result.stdout}\n"
+            report_parts.append(f"\ntfsec Report:\n{scan_result.stdout}")
         if scan_result.stderr:
-            report += f"\nErrors:\n{scan_result.stderr}"
+            report_parts.append(f"\nErrors:\n{scan_result.stderr}")
 
-        return report
+        return "".join(report_parts)
 
     except FileNotFoundError:
+        logger.warning("tfsec executable not found")
         return (
             "Error: `tfsec` command not found. Please ensure it is installed and in your PATH.\n"
             "Installation instructions:\n"
@@ -140,31 +231,40 @@ def terraform_security_scan_tool(files: dict[str, str]) -> str:
             "  - macOS: brew install tfsec\n"
             "  - Linux: Download from https://github.com/aquasecurity/tfsec/releases"
         )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"tfsec command failed: {e.cmd}", exc_info=True)
+        return f"Error: tfsec command failed: {e.stderr}"
     except Exception as e:
+        logger.exception("Unexpected error during security scan")
         return f"An unexpected error occurred during security scan: {str(e)}"
 
+
 @tool
-def terraform_apply_tool(files: dict[str, str]) -> str:
+def terraform_apply_tool(files: Dict[str, str]) -> str:
     """
-    Applies the given Terraform configuration to LocalStack.
-    The dictionary keys are filenames and values are the code content.
-    Uses the same work directory that was already initialized during validation.
-    Returns the `terraform apply` output.
+    Apply Terraform configuration to LocalStack.
+    
+    Uses the work directory that was already initialized during validation.
+    
+    Args:
+        files: Dictionary of filename -> content (used for validation check)
+        
+    Returns:
+        Success message with apply output, or detailed error message
     """
     try:
-        # Use the same work directory that was already initialized during validation
-        # No need to check or re-init - validation always runs first
-        if not os.path.exists(os.path.join(WORK_DIR, ".terraform")):
+        # Verify Terraform is initialized
+        terraform_dir = os.path.join(WORK_DIR, ".terraform")
+        if not os.path.exists(terraform_dir):
             return "Error: Terraform not initialized. Validation must be run first."
         
-        env = os.environ.copy()
-        env.update(LOCALSTACK_ENV)
-
-        # Run terraform apply with -parallelism=1 for better LocalStack compatibility
-        # LocalStack can have issues with highly parallel operations, especially for EC2
-        apply_result = subprocess.run(
-            ["terraform", "apply", "-auto-approve", "-no-color", "-parallelism=1"],
-            cwd=WORK_DIR, capture_output=True, text=True, check=True, env=env
+        env = _get_terraform_env()
+        
+        # Apply with parallelism=1 for better LocalStack compatibility
+        # LocalStack can have issues with highly parallel operations
+        apply_result = _run_terraform_command(
+            ["apply", "-auto-approve", "-no-color", "-parallelism=1"],
+            env
         )
 
         return (
@@ -173,12 +273,11 @@ def terraform_apply_tool(files: dict[str, str]) -> str:
         )
 
     except subprocess.CalledProcessError as e:
-        error_message = (
-            f"Terraform apply command failed.\n"
-            f"Command: '{' '.join(e.cmd)}'\n"
-            f"Stderr: {e.stderr}\n"
-            f"Stdout: {e.stdout}"
-        )
-        return error_message
+        logger.error(f"Terraform apply command failed: {e.cmd}", exc_info=True)
+        return _format_error_message(e)
+    except FileNotFoundError as e:
+        logger.error(f"Terraform executable not found during apply: {e}")
+        return f"Error: Terraform executable not found. Please ensure Terraform is installed and in PATH."
     except Exception as e:
+        logger.exception("Unexpected error during terraform apply")
         return f"An unexpected error occurred during apply: {str(e)}"

@@ -1,0 +1,10 @@
+# Core Dependencies
+python-dotenv
+streamlit
+absl-py
+
+# LangChain and LLM Integration
+langgraph
+langchain-core
+langchain-openai
+langchain-google-genai

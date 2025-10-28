@@ -1,58 +1,23 @@
-# agents.py
-import json
-import os
-from typing import Dict, List, TypedDict
-
+# agents.py - Simplified Generic Approach
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-from tools import (
-    ToolResponseMessages,
-    terraform_apply_tool,
-    terraform_security_scan_tool,
-    terraform_validate_tool,
-)
-
-# Load environment variables
 load_dotenv()
 
+import os
+import json
+from typing import TypedDict, List, Dict
+from langchain_google_genai import ChatGoogleGenerativeAI
+from tools import (
+    ToolResponseMessages,
+    terraform_validate_tool,
+    terraform_apply_tool,
+    terraform_security_scan_tool
+)
+
 # --- Configuration ---
-MAX_RETRIES = 3  # Maximum retry attempts for failed validation/security
-
-
-# --- Environment Validation ---
-def _validate_environment() -> None:
-    """Validate required environment variables at startup."""
-    # At least one API key must be present
-    google_key = os.getenv("GOOGLE_API_KEY")
-    openai_key = os.getenv("OPENAI_API_KEY")
-    github_token = os.getenv("GITHUB_TOKEN")
-    
-    if not (google_key or openai_key or github_token):
-        raise EnvironmentError(
-            "Missing required API key. Please set at least one of:\n"
-            "  - GOOGLE_API_KEY (for Gemini)\n"
-            "  - OPENAI_API_KEY (for OpenAI)\n"
-            "  - GITHUB_TOKEN (for GitHub Models)\n"
-            "Please create a .env file or set these environment variables."
-        )
-    
-    # Log which API is being used
-    if google_key:
-        print("✓ Using Google Gemini API")
-    if openai_key:
-        print("✓ Using OpenAI API available")
-    if github_token:
-        print("✓ Using GitHub Models API available")
-
-
-# Validate at module load
-_validate_environment()
-
+MAX_RETRIES = 3
 
 # --- Define Graph State ---
 class GraphState(TypedDict):
-    """Shared state that flows through the agent graph."""
     initial_request: str
     plan: str
     file_structure: List[Dict[str, str]]
@@ -66,32 +31,26 @@ class GraphState(TypedDict):
     retry_count: int
 
 
-# --- Configure LLM ---
-def _get_llm():
-    """Get configured LLM instance based on available API keys."""
-    google_key = os.getenv("GOOGLE_API_KEY")
-    
-    if google_key:
-        return ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0.0,
-            google_api_key=google_key
-        )
-    
-    # Fallback to OpenAI/GitHub Models if Gemini not available
-    # (Uncomment when needed)
-    # from langchain_openai import ChatOpenAI
-    # return ChatOpenAI(
-    #     model="gpt-4",
-    #     temperature=0.0,
-    #     api_key=os.getenv("OPENAI_API_KEY") or os.getenv("GITHUB_TOKEN")
-    # )
-    
-    raise EnvironmentError("No valid LLM configuration found")
+# Google Gemini
+# llm = ChatGoogleGenerativeAI(
+#     model="gemini-2.5-flash",
+#     temperature=0.0,
+#     google_api_key=os.getenv("GOOGLE_API_KEY")
+# )
+# print("✓ Using Google Gemini API")
 
-
-llm = _get_llm()
-
+# GitHub Models (using OpenAI-compatible API)
+from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(
+    model="gpt-5",
+    temperature=0.0,
+    api_key=os.getenv("GITHUB_TOKEN"),
+    base_url="https://models.inference.ai.azure.com",
+    default_headers={
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}"
+    }
+)
+print("✓ Using GitHub Models API")
 
 # --- Helper Functions ---
 
@@ -104,116 +63,88 @@ def _load_security_rules() -> str:
             return f.read()
     except Exception as e:
         print(f"⚠️ Could not load TFSEC_RULES.md: {e}")
-        # Minimal fallback rules
         return """
-S3: Create 4 resources - bucket + encryption_configuration + public_access_block + versioning
-EC2: metadata_options{http_tokens=required}, associate_public_ip_address=false, ebs_block_device{encrypted=true}
+S3: 4 resources - bucket + encryption(AES256) + public_access_block(all true) + versioning(Enabled)
+EC2: metadata_options{http_tokens=required}, no public IP, encrypted EBS, security group
+DynamoDB: server_side_encryption + point_in_time_recovery
+Lambda: IAM role + tracing_config(Active)
+RDS: storage_encrypted + not publicly_accessible + backup_retention>=7
 """
 
-
 def _create_fallback_structure(initial_request: str) -> dict:
-    """Create a minimal fallback plan structure when LLM response fails."""
+    """Creates a fallback plan structure when LLM response fails."""
     return {
         "plan": "1. Configure AWS provider for LocalStack\n2. Create requested resources with security",
         "file_structure": [
-            {
-                "file_name": "provider.tf",
-                "brief": "AWS provider: region=us-east-1, credentials=test/test, s3_use_path_style=true, endpoint=http://localhost:4566"
-            },
-            {
-                "file_name": "main.tf",
-                "brief": f"Create resources for: {initial_request}"
-            }
+            {"file_name": "provider.tf", "brief": "AWS provider for LocalStack: region us-east-1, test creds, all endpoints http://localhost:4566"},
+            {"file_name": "main.tf", "brief": f"Create all resources needed for: {initial_request}"}
         ]
     }
 
-
 def _parse_llm_json_response(response_content: str) -> dict:
-    """
-    Parse LLM response that may contain JSON wrapped in markdown code blocks.
-    
-    Args:
-        response_content: Raw LLM response content
-        
-    Returns:
-        Parsed JSON dictionary
-        
-    Raises:
-        json.JSONDecodeError: If JSON parsing fails
-    """
-    cleaned = response_content.strip()
-    
-    # Remove markdown code fences
-    if "```json" in cleaned:
-        cleaned = cleaned.split("```json")[1].split("```")[0]
-    elif "```" in cleaned:
-        cleaned = cleaned.replace("```", "")
-    
+    """Parse LLM response that may contain JSON wrapped in markdown."""
+    cleaned = response_content.strip().replace("```json", "").replace("```", "")
     return json.loads(cleaned.strip())
-
-
-def _build_feedback_message(state: GraphState) -> str:
-    """
-    Build comprehensive feedback message from validation and security failures.
-    
-    Args:
-        state: Current graph state
-        
-    Returns:
-        Formatted feedback string for LLM context
-    """
-    feedback_parts = []
-    
-    # Add validation errors
-    if state.get("validation_report") and not state.get("validation_passed"):
-        feedback_parts.append(
-            f"\n🔴 PREVIOUS VALIDATION ERRORS:\n{state['validation_report']}\n\n"
-            "👉 Analyze WHY these errors occurred and FIX them in the new plan.\n"
-            "Common fixes: Check resource names, syntax, required parameters, security configs."
-        )
-    
-    # Add security scan failures
-    if state.get("security_report") and not state.get("security_passed"):
-        feedback_parts.append(
-            f"\n🛡️ SECURITY SCAN FAILURES:\n{state['security_report']}\n\n"
-            "👉 These are tfsec policy violations. Review the SECURITY RULES below and ensure ALL are implemented."
-        )
-    
-    # Add human feedback
-    if state.get('human_feedback'):
-        feedback_parts.append(f"\n💬 USER FEEDBACK:\n{state['human_feedback']}")
-    
-    return "\n".join(feedback_parts)
-
 
 # --- Agent Classes ---
 
 class PlannerArchitectAgent:
-    """Creates architecture plan and file structure. Learns from validation/security errors."""
+    """Creates plan AND file structure with detailed briefs."""
     
-    def run(self, state: GraphState) -> dict:
-        """
-        Generate infrastructure plan with file structure.
-        
-        Args:
-            state: Current graph state containing request and feedback
-            
-        Returns:
-            Dictionary with 'plan' and 'file_structure' keys
-        """
+    def run(self, state: GraphState):
         print("\n🧠 Planning architecture...")
         
-        # Increment retry count if coming from a failure
         retry_count = state.get("retry_count", 0)
-        if not state.get("validation_passed") or not state.get("security_passed"):
-            if state.get("validation_report") or state.get("security_report"):
-                retry_count += 1
-                print(f"⚠️  Retry attempt {retry_count}/{MAX_RETRIES}")
+        error_context = ""
+        
+        if state.get("validation_report") and not state.get("validation_passed"):
+            retry_count += 1
+            print(f"⚠️  Retry attempt {retry_count}/{MAX_RETRIES}")
+            error_context = f"""
+⚠️ PREVIOUS ERRORS TO FIX:
+{state['validation_report']}
+
+FIX BY: Analyzing the exact error and being more specific in resource briefs.
+"""
         
         security_rules = _load_security_rules()
-        feedback = _build_feedback_message(state)
+        prompt = f"""Think step-by-step to create a MINIMAL Terraform architecture.
+
+User wants: {state['initial_request']}
+{error_context}
+
+Reasoning process:
+1. What AWS resources are EXPLICITLY requested? (Don't add extras)
+2. What security configs are MANDATORY for these resources?
+3. What files are needed? (provider.tf always + main.tf)
+
+🔐 SECURITY REQUIREMENTS:
+{security_rules}
+
+⚠️ KEEP IT SIMPLE:
+- NO variables.tf or outputs.tf unless explicitly requested
+- NO KMS keys (use AES256)
+- NO log buckets (unless asked)
+- 3-5 steps max in plan
+- Be SPECIFIC in briefs: list each resource type with key attributes
+
+OUTPUT JSON:
+{{
+  "plan": "1. Setup provider\\n2. Create [specific resource]\\n3. Add [specific security config]",
+  "files": [
+    {{"file_name": "provider.tf", "brief": "AWS provider for LocalStack: region us-east-1, test creds, all endpoints http://localhost:4566"}},
+    {{"file_name": "main.tf", "brief": "Resource-by-resource list with key attributes. Example: aws_s3_bucket 'bucket1' bucket='name', aws_s3_bucket_server_side_encryption_configuration 'bucket1' sse_algorithm=AES256, aws_s3_bucket_public_access_block 'bucket1' all=true, aws_s3_bucket_versioning 'bucket1' status=Enabled"}}
+  ]
+}}
+
+GOOD brief: "aws_dynamodb_table 'users' hash_key='id':S billing_mode=PAY_PER_REQUEST server_side_encryption enabled=true point_in_time_recovery enabled=true"
+BAD brief: "Create DynamoDB table" (too vague!)
+
+CRITICAL: The brief for main.tf MUST list EVERY resource that will be created with their key attributes."""
+
+        if state.get('human_feedback'):
+            prompt += f"\n\nHuman feedback: {state['human_feedback']}"
         
-        prompt = self._build_planning_prompt(state['initial_request'], feedback, security_rules)
         response = llm.invoke(prompt)
         
         try:
@@ -223,81 +154,95 @@ class PlannerArchitectAgent:
             
             if not plan or not file_structure:
                 print("⚠️ Warning: Response missing plan or files. Using fallback.")
-                return _create_fallback_structure(state['initial_request'])
+                return {**_create_fallback_structure(state['initial_request']), "retry_count": retry_count}
             
             print(f"✅ Plan created: {len(file_structure)} files to generate")
             return {
-                "plan": plan, 
+                "plan": plan,
                 "file_structure": file_structure,
                 "retry_count": retry_count
             }
             
         except json.JSONDecodeError as e:
-            print(f"❌ ERROR: Invalid JSON response: {e}")
-            print(f"Response preview: {response.content[:500]}")
-            return _create_fallback_structure(state['initial_request'])
-    
-    @staticmethod
-    def _build_planning_prompt(initial_request: str, feedback: str, security_rules: str) -> str:
-        """Build the planning prompt for the LLM."""
-        return f"""You are an expert Terraform architect. Create MINIMAL, SIMPLE infrastructure for: "{initial_request}"
-{feedback}
-
-📋 SECURITY RULES (implement only if relevant):
-{security_rules}
-
-🎯 KEEP IT SIMPLE:
-1. What resources are needed? (ONLY what's requested - don't add extras)
-2. How many instances/resources?
-3. What specifications? (RAM → instance_type, storage size, etc.)
-
-⚡ CRITICAL RULES:
-- ONLY create 2 files MAXIMUM: provider.tf and main.tf
-- Put ALL resources in main.tf (bucket + encryption + public_access_block + versioning in ONE file)
-- Keep it MINIMAL - don't over-engineer
-- For S3: Put bucket AND its security configs (encryption, public_access_block, versioning) in main.tf
-- For EC2: Only create if explicitly requested
-
-OUTPUT VALID JSON (EXACTLY 2 files):
-{{
-  "plan": "1. Configure LocalStack provider\\n2. Create requested resources with security",
-  "files": [
-    {{"file_name": "provider.tf", "brief": "AWS provider: region=us-east-1, credentials=test/test, all endpoints=http://localhost:4566, s3_use_path_style=true"}},
-    {{"file_name": "main.tf", "brief": "ALL resources in ONE file: [describe EXACTLY what user requested] with security configs"}}
-  ]
-}}
-"""
+            print(f"❌ ERROR: PlannerArchitect did not return valid JSON: {e}")
+            print(f"Response was: {response.content[:500]}")
+            return {**_create_fallback_structure(state['initial_request']), "retry_count": retry_count}
 
 
 class CodeGeneratorAgent:
-    """Generates HCL code for files based on detailed specifications."""
+    """Generates HCL code for a single file based on a brief."""
     
-    def run(self, state: GraphState) -> dict:
-        """
-        Generate Terraform code for the next file in the queue.
-        
-        Args:
-            state: Current graph state containing file_structure and generated_files
-            
-        Returns:
-            Dictionary with updated 'generated_files' and 'file_structure'
-        """
+    def run(self, state: GraphState):
         files_to_generate = state["file_structure"]
         if not files_to_generate:
             return {}
 
-        # Process next file in queue
-        current_file = files_to_generate.pop(0)
-        file_name = current_file["file_name"]
-        brief = current_file["brief"]
+        # Take the next file to generate from the list
+        current_file_spec = files_to_generate.pop(0)
+        file_name = current_file_spec["file_name"]
+        brief = current_file_spec["brief"]
 
         print(f"\n💻 Generating {file_name}...")
         
-        prompt = self._build_generation_prompt(file_name, brief)
+        prompt = f"""Generate HCL code for {file_name}. Output ONLY code, NO markdown, NO explanations.
+
+Brief: {brief}
+
+RULES:
+- Follow the brief exactly - it contains all resource names and key attributes
+- For provider.tf: LocalStack endpoints (us-east-1, test/test, http://localhost:4566)
+- Use .id for resource references (e.g., aws_s3_bucket.name.id)
+- Keep code clean and minimal
+- Output pure HCL code only
+
+**Correct provider.tf for LocalStack:**
+```hcl
+terraform {{
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }}
+  }}
+}}
+
+provider "aws" {{
+  region                      = "us-east-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+  s3_use_path_style           = true
+
+  endpoints {{
+    s3           = "http://localhost:4566"
+    lambda       = "http://localhost:4566"
+    dynamodb     = "http://localhost:4566"
+    apigateway   = "http://localhost:4566"
+    iam          = "http://localhost:4566"
+    sts          = "http://localhost:4566"
+    sqs          = "http://localhost:4566"
+    sns          = "http://localhost:4566"
+    ec2          = "http://localhost:4566"
+    rds          = "http://localhost:4566"
+  }}
+}}
+```
+
+Now, generate the complete and correct HCL code for: {file_name}
+"""
         response = llm.invoke(prompt)
         
-        # Clean markdown code fences from response
-        generated_code = self._clean_code_response(response.content)
+        # Clean up markdown formatting
+        generated_code = response.content.strip()
+        for fence in ["```hcl", "```terraform", "```"]:
+            if fence in generated_code:
+                parts = generated_code.split(fence)
+                if len(parts) >= 2:
+                    generated_code = parts[1].split("```")[0] if fence != "```" else parts[1]
+                    break
+        generated_code = generated_code.strip()
         
         print(f"✓ Generated {file_name} ({len(generated_code)} bytes)")
         
@@ -309,131 +254,56 @@ class CodeGeneratorAgent:
             "generated_files": updated_files,
             "file_structure": files_to_generate
         }
-    
-    @staticmethod
-    def _build_generation_prompt(file_name: str, brief: str) -> str:
-        """Build the code generation prompt for the LLM."""
-        return f"""Generate SIMPLE, MINIMAL HCL (Terraform) code for: {file_name}
-
-📝 BRIEF: {brief}
-
-⚡ CRITICAL:
-- Output ONLY valid HCL code, NO explanations, NO markdown
-- Keep it SIMPLE - don't over-engineer
-- For S3 buckets: Include bucket + encryption config + public_access_block + versioning in main.tf
-- For provider.tf: Only essential endpoints (s3, ec2, dynamodb, lambda, rds if needed)
-
-📌 CONSTANTS:
-- AMI: ami-ff0fea8310f3
-- Region: us-east-1
-- Endpoint: http://localhost:4566
-- Credentials: access_key="test", secret_key="test"
-
-Generate the code:
-"""
-    
-    @staticmethod
-    def _clean_code_response(response_content: str) -> str:
-        """Remove markdown code fences from LLM response."""
-        cleaned = response_content.strip()
-        
-        # Remove various markdown code fence formats
-        for fence in ["```hcl", "```terraform", "```"]:
-            if fence in cleaned:
-                parts = cleaned.split(fence)
-                if len(parts) >= 2:
-                    cleaned = parts[1].split("```")[0] if fence != "```" else parts[1]
-                    break
-        
-        return cleaned.strip()
 
 
 class CodeValidatorAgent:
-    """Validates generated Terraform files using terraform validate and fmt."""
+    """Validates the entire set of generated Terraform files."""
     
-    def run(self, state: GraphState) -> dict:
-        """
-        Validate all generated Terraform files.
-        
-        Args:
-            state: Current graph state containing generated_files
-            
-        Returns:
-            Dictionary with validation_report, validation_passed, and formatted files
-        """
+    def run(self, state: GraphState):
         print("\n🔍 Validating Terraform code...")
         files = state["generated_files"]
         
         validation_report = terraform_validate_tool.invoke({"files": files})
         validation_passed = ToolResponseMessages.VALIDATION_SUCCESS in validation_report
 
-        # Extract formatted files if validation succeeded
-        formatted_files = self._extract_formatted_files(validation_report, files, validation_passed)
-        
-        status = "✅" if validation_passed else "❌"
-        print(f"{status} Terraform syntax validation {'successful' if validation_passed else 'failed'}.")
+        formatted_files = files
+        if validation_passed:
+            print("✅ Terraform syntax validation successful.")
+            try:
+                json_part = validation_report.split(ToolResponseMessages.VALIDATION_PREFIX)
+                if len(json_part) > 1:
+                    formatted_files = json.loads(json_part[1].strip())
+            except (IndexError, json.JSONDecodeError):
+                print("⚠️ Warning: Could not parse formatted code from tool output.")
+        else:
+            print("❌ Terraform syntax validation failed.")
 
         return {
             "validation_report": validation_report,
             "validation_passed": validation_passed,
             "generated_files": formatted_files
         }
-    
-    @staticmethod
-    def _extract_formatted_files(validation_report: str, original_files: dict, validation_passed: bool) -> dict:
-        """Extract formatted files from validation report or return originals."""
-        if not validation_passed:
-            return original_files
-        
-        try:
-            # Parse formatted files from tool output
-            if ToolResponseMessages.VALIDATION_PREFIX in validation_report:
-                json_part = validation_report.split(ToolResponseMessages.VALIDATION_PREFIX)[1].strip()
-                return json.loads(json_part)
-        except (IndexError, json.JSONDecodeError) as e:
-            print(f"⚠️ Warning: Could not parse formatted code: {e}")
-        
-        return original_files
 
 
 class DeployerAgent:
-    """Deploys validated Terraform code to LocalStack."""
+    """Deploys the validated code to LocalStack."""
     
-    def run(self, state: GraphState) -> dict:
-        """
-        Deploy infrastructure to LocalStack.
-        
-        Args:
-            state: Current graph state containing validation status and files
-            
-        Returns:
-            Dictionary with deployment_report
-        """
+    def run(self, state: GraphState):
         print("\n🚀 Deploying to LocalStack...")
-        
         if not state.get("validation_passed"):
-            return {"deployment_report": "Skipping deployment: validation failed."}
+            return {"deployment_report": "Skipping deployment because validation failed."}
         
         files = state["generated_files"]
         deployment_report = terraform_apply_tool.invoke({"files": files})
-        
         print("✅ Deployment complete")
+        
         return {"deployment_report": deployment_report}
 
 
 class SecurityScannerAgent:
-    """Scans Terraform code for security vulnerabilities using tfsec."""
+    """Scans the validated Terraform code for security vulnerabilities using tfsec."""
     
-    def run(self, state: GraphState) -> dict:
-        """
-        Run security scan on generated Terraform files.
-        
-        Args:
-            state: Current graph state containing generated_files
-            
-        Returns:
-            Dictionary with security_report, security_passed, and potentially updated validation status
-        """
+    def run(self, state: GraphState):
         print("\n🛡️ Running security scan (tfsec)...")
         files = state["generated_files"]
         
@@ -448,17 +318,12 @@ class SecurityScannerAgent:
             }
         else:
             print("❌ tfsec security scan found issues.")
-            # Combine security issues with validation report for planner to address
-            combined_report = self._combine_reports(state.get("validation_report", ""), security_report)
-            
+            # Append security issues to validation_report so PlannerAgent can address them
+            existing_report = state.get("validation_report", "")
+            combined_report = f"{existing_report}\n\n--- SECURITY ISSUES ---\n{security_report}"
             return {
                 "security_report": security_report,
                 "security_passed": False,
                 "validation_report": combined_report,
-                "validation_passed": False  # Trigger retry through planner
+                "validation_passed": False  # Mark validation as failed to trigger retry
             }
-    
-    @staticmethod
-    def _combine_reports(validation_report: str, security_report: str) -> str:
-        """Combine validation and security reports for comprehensive feedback."""
-        return f"{validation_report}\n\n--- SECURITY ISSUES ---\n{security_report}"

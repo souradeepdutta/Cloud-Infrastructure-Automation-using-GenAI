@@ -28,6 +28,7 @@ class GraphState(TypedDict):
     validation_passed: bool
     security_report: str
     security_passed: bool
+    deployment_passed: bool
     retry_count: int
 
 
@@ -195,7 +196,24 @@ RULES:
 - Keep code clean and minimal
 - Output pure HCL code only
 
-**Correct provider.tf for AWS:**
+**CRITICAL: Generate unique resource names using random_id**
+ALWAYS include this resource at the top of main.tf to ensure unique names:
+```hcl
+resource "random_id" "suffix" {{
+  byte_length = 4
+}}
+```
+
+Then use it for ALL resource names that need to be globally/regionally unique:
+- S3 buckets: bucket = "my-bucket-${{random_id.suffix.hex}}"
+- Security groups: name_prefix = "my-sg-${{random_id.suffix.hex}}-"
+- DynamoDB tables: name = "my-table-${{random_id.suffix.hex}}"
+- Lambda functions: function_name = "my-function-${{random_id.suffix.hex}}"
+- RDS instances: identifier = "my-db-${{random_id.suffix.hex}}"
+- IAM roles: name = "my-role-${{random_id.suffix.hex}}"
+- KMS keys: use description with timestamp (descriptions don't need to be unique)
+
+**Correct provider.tf for AWS (include random provider):**
 ```hcl
 terraform {{
   required_providers {{
@@ -203,11 +221,50 @@ terraform {{
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }}
+    random = {{
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }}
   }}
 }}
 
 provider "aws" {{
   region = "us-east-1"
+}}
+```
+
+**IMPORTANT for EC2 instances:**
+When using default VPC, get subnets using this CORRECT method:
+```hcl
+data "aws_vpc" "default" {{
+  default = true
+}}
+
+data "aws_subnets" "default" {{
+  filter {{
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }}
+}}
+```
+Then reference subnet with: subnet_id = tolist(data.aws_subnets.default.ids)[0]
+
+DO NOT use "default_for_az" filter - it doesn't exist in AWS API.
+
+**IMPORTANT for Security Groups:**
+Use name_prefix with random_id suffix for uniqueness:
+```hcl
+resource "aws_security_group" "example" {{
+  name_prefix = "example-sg-${{random_id.suffix.hex}}-"
+  description = "Security group description"
+  vpc_id      = data.aws_vpc.default.id
+  
+  egress {{
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }}
 }}
 ```
 
@@ -274,11 +331,30 @@ class DeployerAgent:
         if not state.get("validation_passed"):
             return {"deployment_report": "Skipping deployment because validation failed."}
         
+        if not state.get("security_passed"):
+            return {"deployment_report": "Skipping deployment because security scan failed."}
+        
         files = state["generated_files"]
         deployment_report = terraform_apply_tool.invoke({"files": files})
-        print("✅ Deployment complete")
         
-        return {"deployment_report": deployment_report}
+        # Check if deployment actually succeeded
+        if "Terraform apply successful" in deployment_report:
+            print("✅ Deployment complete")
+            return {
+                "deployment_report": deployment_report,
+                "deployment_passed": True
+            }
+        else:
+            print("❌ Deployment failed")
+            # Treat deployment failure as validation failure to trigger retry
+            existing_report = state.get("validation_report", "")
+            combined_report = f"{existing_report}\n\n--- DEPLOYMENT ERRORS ---\n{deployment_report}"
+            return {
+                "deployment_report": deployment_report,
+                "deployment_passed": False,
+                "validation_report": combined_report,
+                "validation_passed": False  # Mark validation as failed to trigger retry
+            }
 
 
 class SecurityScannerAgent:

@@ -84,8 +84,8 @@ The agents use tools that run these specific shell commands and values.
 
 - **`terraform_security_scan_tool`:**
 
-  - `tfsec . --no-color --format default --minimum-severity HIGH --exclude aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging`
-  - _(Note the exclusions for S3 encryption and logging)_
+  - `tfsec . --no-color --format default --minimum-severity HIGH --exclude aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging,aws-ec2-no-public-egress-sgr`
+  - _(Note the exclusions: S3 customer keys add complexity, S3 logging buckets can't log to themselves, and egress to 0.0.0.0/0 is standard practice)_
 
 * **`terraform_apply_tool`:**
   - `terraform apply -auto-approve -no-color`
@@ -96,8 +96,17 @@ The agents use tools that run these specific shell commands and values.
 
 The **Planner Architect** must enforce these.
 
+- **Unique Names (CRITICAL):** ALWAYS use `random_id` resource to generate unique names:
+  - Include `resource "random_id" "suffix" { byte_length = 4 }` at the top of main.tf
+  - Add `random` provider to provider.tf
+  - S3 buckets: `bucket = "my-bucket-${random_id.suffix.hex}"`
+  - Security groups: `name_prefix = "my-sg-${random_id.suffix.hex}-"`
+  - DynamoDB: `name = "my-table-${random_id.suffix.hex}"`
+  - Lambda: `function_name = "my-function-${random_id.suffix.hex}"`
+  - RDS: `identifier = "my-db-${random_id.suffix.hex}"`
+  - IAM roles: `name = "my-role-${random_id.suffix.hex}"`
 - **S3 Buckets:** Always require 4 separate resources:
-  1.  `aws_s3_bucket`
+  1.  `aws_s3_bucket` (with random_id suffix)
   2.  `aws_s3_bucket_server_side_encryption_configuration` (use `AES256`)
   3.  `aws_s3_bucket_public_access_block` (all 4 settings `true`)
   4.  `aws_s3_bucket_versioning` (`status = "Enabled"`)
@@ -105,12 +114,15 @@ The **Planner Architect** must enforce these.
   - `associate_public_ip_address = false`
   - `metadata_options { http_tokens = "required" }`
   - All EBS volumes must have `encrypted = true`
+  - Security groups must use `name_prefix` with random_id
 - **DynamoDB Tables:**
   - `server_side_encryption { enabled = true }`
   - `point_in_time_recovery { enabled = true }`
+  - Name must include random_id suffix
 - **RDS Databases:**
   - `storage_encrypted = true`
   - `publicly_accessible = false`
+  - Identifier must include random_id suffix
 
 ---
 

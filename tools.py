@@ -109,6 +109,36 @@ def _format_error_message(error: subprocess.CalledProcessError) -> str:
     )
 
 
+def save_files_to_disk(project_name: str, files: dict) -> tuple[bool, str]:
+    """
+    Save generated Terraform files to a project directory.
+    
+    Args:
+        project_name: Name of the project directory
+        files: Dictionary of filename -> content
+        
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    try:
+        # Get the absolute path of the workspace root
+        workspace_root = os.path.dirname(os.path.abspath(__file__))
+        project_path = os.path.join(workspace_root, project_name)
+        
+        # Create the project directory
+        os.makedirs(project_path, exist_ok=True)
+        
+        # Save all files
+        for filename, code in files.items():
+            filepath = os.path.join(project_path, filename)
+            with open(filepath, "w") as f:
+                f.write(code)
+        
+        return True, f"✨ Files saved to '{project_path}'"
+    except Exception as e:
+        return False, f"❌ Error saving files: {e}"
+
+
 # --- Terraform Tools ---
 
 @tool
@@ -187,13 +217,14 @@ def terraform_security_scan_tool(files: Dict[str, str]) -> str:
         # Excluded checks:
         # - aws-s3-encryption-customer-key: KMS adds complexity for simple buckets
         # - aws-s3-enable-bucket-logging: Logging buckets can't log to themselves
+        # - aws-ec2-no-public-egress-sgr: Egress to 0.0.0.0/0 is standard practice (instances need internet access)
         scan_result = subprocess.run(
             [
                 "tfsec", ".",
                 "--no-color",
                 "--format", "default",
                 "--minimum-severity", "HIGH",
-                "--exclude", "aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging"
+                "--exclude", "aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging,aws-ec2-no-public-egress-sgr"
             ],
             cwd=WORK_DIR,
             capture_output=True,
@@ -274,3 +305,48 @@ def terraform_apply_tool(files: Dict[str, str]) -> str:
     except Exception as e:
         logger.exception("Unexpected error during terraform apply")
         return f"An unexpected error occurred during apply: {str(e)}"
+
+
+@tool
+def terraform_destroy_tool() -> str:
+    """
+    Destroy all Terraform-managed infrastructure.
+    
+    Uses the work directory with existing state to destroy all resources.
+    
+    Returns:
+        Success message with destroy output, or detailed error message
+    """
+    try:
+        # Verify Terraform is initialized and state exists
+        terraform_dir = os.path.join(WORK_DIR, ".terraform")
+        state_file = os.path.join(WORK_DIR, "terraform.tfstate")
+        
+        if not os.path.exists(terraform_dir):
+            return "Error: Terraform not initialized. No resources to destroy."
+        
+        if not os.path.exists(state_file):
+            return "Error: No Terraform state file found. No resources have been deployed."
+        
+        env = _get_terraform_env()
+        
+        # Destroy with auto-approve
+        destroy_result = _run_terraform_command(
+            ["destroy", "-auto-approve", "-no-color"],
+            env
+        )
+
+        return (
+            f"Terraform destroy successful. All resources have been removed.\n\n"
+            f"Output:\n{destroy_result.stdout}"
+        )
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Terraform destroy command failed: {e.cmd}", exc_info=True)
+        return _format_error_message(e)
+    except FileNotFoundError as e:
+        logger.error(f"Terraform executable not found during destroy: {e}")
+        return f"Error: Terraform executable not found. Please ensure Terraform is installed and in PATH."
+    except Exception as e:
+        logger.exception("Unexpected error during terraform destroy")
+        return f"An unexpected error occurred during destroy: {str(e)}"

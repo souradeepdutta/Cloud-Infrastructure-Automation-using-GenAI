@@ -1,43 +1,10 @@
 
-# Byte-compiled / cache / env files
-__pycache__/
-*.py[cod]
-venv/
-.env
-
-# Terraform plugin and cache
-terraform_plugin_cache/
-terraform_work/
-volume/
-
-# Sensitive or generated files
-terraform_automation_accessKeys.csv
-volume/cache/*
-
-# Ignore all tf-project-* folders
-tf-project-*/
-
-# Ignore all .tfstate files
-*.tfstate
-*.tfstate.*
-
-# Ignore logs and tmp
-volume/logs/
-volume/tmp/
-
-# Keep tracked files
-!main.py
-!tools.py
-!docker-compose.yml
-!agents.py
-!streamlit_app.py
-!TFSEC_RULES.md
-!TFSEC_SECURITY_POLICIES.md
-!requirements.txt
-!LLM_CONTEXT.md
-!utils.py
-!workflow.py
+# Ignore everything by default
+*
 !app.py
-
-# Don't ignore .gitignore itself
+!agents.py
+!workflow.py
+!requirements.txt
+!tools.py
+!TFSEC_RULES.md
 !.gitignore

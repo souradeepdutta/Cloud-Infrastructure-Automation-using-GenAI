@@ -59,6 +59,13 @@ def security_router(state: GraphState):
     return _retry_or_end_router(state)
 
 
+def deployment_router(state: GraphState):
+    """Route after deployment: check if deployment succeeded or needs retry."""
+    if state.get("deployment_passed"):
+        return "end"
+    return _retry_or_end_router(state)
+
+
 def _retry_or_end_router(state: GraphState):
     """Determine whether to retry or end based on retry count and feedback."""
     retry_count = state.get("retry_count", 0)
@@ -85,7 +92,6 @@ def build_workflow():
     # Set entry point and simple edges
     workflow.set_entry_point("planner_architect")
     workflow.add_edge("planner_architect", "code_generator")
-    workflow.add_edge("deployer", END)
 
     # Add conditional routing edges
     workflow.add_conditional_edges(
@@ -109,6 +115,15 @@ def build_workflow():
         security_router,
         {
             "deployer": "deployer",
+            "end": END,
+            "planner_architect": "planner_architect"
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "deployer",
+        deployment_router,
+        {
             "end": END,
             "planner_architect": "planner_architect"
         }

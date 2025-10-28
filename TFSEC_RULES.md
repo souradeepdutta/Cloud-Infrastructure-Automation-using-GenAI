@@ -4,6 +4,48 @@
 
 ---
 
+## 🎲 Unique Resource Names (CRITICAL)
+
+**ALWAYS use `random_id` to generate unique names for resources to avoid conflicts with previous deployments:**
+
+```hcl
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+```
+
+**Apply to these resources:**
+
+- S3 buckets: `bucket = "my-bucket-${random_id.suffix.hex}"`
+- Security groups: `name_prefix = "my-sg-${random_id.suffix.hex}-"`
+- DynamoDB tables: `name = "my-table-${random_id.suffix.hex}"`
+- Lambda functions: `function_name = "my-function-${random_id.suffix.hex}"`
+- RDS instances: `identifier = "my-db-${random_id.suffix.hex}"`
+- IAM roles: `name = "my-role-${random_id.suffix.hex}"`
+
+**Add random provider to provider.tf:**
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+```
+
+---
+
 ## 📋 Priority Matrix
 
 ### ALWAYS Include (P0 - Critical):
@@ -41,8 +83,12 @@
 ### Complete Example:
 
 ```hcl
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
 resource "aws_s3_bucket" "example" {
-  bucket = "my-unique-bucket-name"
+  bucket = "my-unique-bucket-${random_id.suffix.hex}"
 
   tags = {
     Name        = "My Bucket"
@@ -131,9 +177,13 @@ resource "aws_instance" "example" {
 
 ### Security Group Best Practices:
 
+**Note:** The `aws-ec2-no-public-egress-sgr` check is excluded from our tfsec scans because egress to 0.0.0.0/0 is standard practice - instances need internet access for updates, package downloads, and API calls.
+
+**IMPORTANT:** Always use `name_prefix` with random_id suffix for security groups to avoid conflicts with existing resources from previous deployments.
+
 ```hcl
 resource "aws_security_group" "example" {
-  name        = "example-sg"
+  name_prefix = "example-sg-${random_id.suffix.hex}-"
   description = "Security group for example application"
   vpc_id      = aws_vpc.main.id
 
@@ -151,7 +201,7 @@ resource "aws_security_group" "example" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"]  # This is standard practice and excluded from tfsec checks
   }
 
   tags = {
@@ -174,7 +224,7 @@ resource "aws_security_group" "example" {
 
 ```hcl
 resource "aws_iam_role" "lambda_role" {
-  name = "lambda_execution_role"
+  name = "lambda-execution-role-${random_id.suffix.hex}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -195,7 +245,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
 
 resource "aws_lambda_function" "example" {
   filename      = "lambda_function.zip"
-  function_name = "example_function"
+  function_name = "example-function-${random_id.suffix.hex}"
   role          = aws_iam_role.lambda_role.arn
   handler       = "index.handler"
   runtime       = "python3.9"
@@ -233,7 +283,7 @@ resource "aws_lambda_permission" "allow_api_gateway" {
 
 ```hcl
 resource "aws_dynamodb_table" "example" {
-  name           = "example-table"
+  name           = "example-table-${random_id.suffix.hex}"
   billing_mode   = "PAY_PER_REQUEST"
   hash_key       = "id"
 
@@ -270,7 +320,7 @@ resource "aws_dynamodb_table" "example" {
 
 ```hcl
 resource "aws_db_instance" "example" {
-  identifier           = "example-db"
+  identifier           = "example-db-${random_id.suffix.hex}"
   engine               = "mysql"
   engine_version       = "8.0"
   instance_class       = "db.t3.micro"

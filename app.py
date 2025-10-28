@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Tuple, List
 import streamlit as st
 
 from workflow import build_workflow
-from utils import save_files_to_disk
+from tools import terraform_destroy_tool, save_files_to_disk
 
 # --- Configuration ---
 MAX_RETRIES = 3
@@ -62,6 +62,7 @@ def initialize_session_state():
         "generated_files": {},
         "validation_passed": False,
         "security_passed": False,
+        "deployment_passed": False,
         "validation_report": "",
         "security_report": "",
         "deployment_report": "",
@@ -209,6 +210,7 @@ def update_session_state_from_workflow(final_state: Optional[Dict[str, Any]], el
         st.session_state.generated_files = final_state.get("generated_files", {})
         st.session_state.validation_passed = final_state.get("validation_passed", False)
         st.session_state.security_passed = final_state.get("security_passed", False)
+        st.session_state.deployment_passed = final_state.get("deployment_passed", False)
         st.session_state.validation_report = final_state.get("validation_report", "")
         st.session_state.security_report = final_state.get("security_report", "")
         st.session_state.deployment_report = final_state.get("deployment_report", "")
@@ -339,3 +341,29 @@ if st.session_state.process_complete:
                 st.success(message)
             else:
                 st.error(message)
+    
+    # Destroy resources section - only show if deployment was successful
+    if st.session_state.deployment_passed:
+        st.divider()
+        st.markdown("### Destroy Resources:")
+        st.warning("⚠️ This will permanently delete all deployed AWS resources. This action cannot be undone.")
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("🗑️ Destroy All Resources", type="secondary", use_container_width=True):
+                with st.spinner("Destroying resources..."):
+                    try:
+                        destroy_result = terraform_destroy_tool.invoke({})
+                        
+                        if "Terraform destroy successful" in destroy_result:
+                            st.success("✅ All resources have been successfully destroyed!")
+                            st.code(destroy_result, language="")
+                            
+                            # Update session state to reflect destruction
+                            st.session_state.deployment_passed = False
+                        else:
+                            st.error("❌ Failed to destroy resources")
+                            st.code(destroy_result, language="")
+                    except Exception as e:
+                        st.error(f"❌ Error during destroy: {str(e)}")
+

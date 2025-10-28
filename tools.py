@@ -12,12 +12,7 @@ from langchain_core.tools import tool
 logger = logging.getLogger(__name__)
 
 
-# --- Constants ---
-LOCALSTACK_ENV = {
-    "AWS_ACCESS_KEY_ID": "test",
-    "AWS_SECRET_ACCESS_KEY": "test",
-    "AWS_DEFAULT_REGION": "us-east-1",
-}
+
 
 # Success indicators for tool responses
 class ToolResponseMessages:
@@ -61,10 +56,9 @@ def _get_terraform_env() -> dict:
     Get environment variables for Terraform execution.
     
     Returns:
-        Dictionary with environment variables including LocalStack config
+        Dictionary with environment variables
     """
     env = os.environ.copy()
-    env.update(LOCALSTACK_ENV)
     env["TF_PLUGIN_CACHE_DIR"] = PLUGIN_CACHE_DIR
     env["TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE"] = "true"
     return env
@@ -120,7 +114,7 @@ def _format_error_message(error: subprocess.CalledProcessError) -> str:
 @tool
 def terraform_validate_tool(files: Dict[str, str]) -> str:
     """
-    Validate and format Terraform files against LocalStack.
+    Validate and format Terraform files.
     
     Runs terraform init, validate, and fmt on the provided files.
     
@@ -242,7 +236,7 @@ def terraform_security_scan_tool(files: Dict[str, str]) -> str:
 @tool
 def terraform_apply_tool(files: Dict[str, str]) -> str:
     """
-    Apply Terraform configuration to LocalStack.
+    Apply Terraform configuration to AWS.
     
     Uses the work directory that was already initialized during validation.
     
@@ -260,10 +254,9 @@ def terraform_apply_tool(files: Dict[str, str]) -> str:
         
         env = _get_terraform_env()
         
-        # Apply with parallelism=1 for better LocalStack compatibility
-        # LocalStack can have issues with highly parallel operations
+        # Apply with auto-approve
         apply_result = _run_terraform_command(
-            ["apply", "-auto-approve", "-no-color", "-parallelism=1"],
+            ["apply", "-auto-approve", "-no-color"],
             env
         )
 

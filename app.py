@@ -86,20 +86,20 @@ app = build_workflow()
 
 # --- UI Layout ---
 st.markdown('<div class="main-header">AWS Infrastructure Generator</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">LocalStack-powered Infrastructure as Code</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">AWS-powered Infrastructure as Code</div>', unsafe_allow_html=True)
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("📋 About")
     st.info("""
-    This tool generates Terraform code for AWS infrastructure and deploys it to LocalStack.
+    This tool generates Terraform code for AWS infrastructure and deploys it to the cloud.
     
     **Features:**
     - 🧠 AI-powered architecture planning
     - 💻 Terraform code generation
     - 🔍 Syntax validation
     - 🛡️ Security scanning (tfsec)
-    - 🚀 LocalStack deployment
+    - 🚀 AWS deployment
     """)
     
     st.header("⚙️ Settings")

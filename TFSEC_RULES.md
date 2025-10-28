@@ -1,4 +1,4 @@
-# tfsec Security Rules for AWS Infrastructure (LocalStack Compatible)
+# tfsec Security Rules for AWS Infrastructure
 
 **Source**: https://aquasecurity.github.io/tfsec/latest/checks/aws/
 
@@ -449,17 +449,6 @@ resource "aws_ecr_repository" "example" {
 2. **Enable Cache Encryption**: Encrypt API cache
 3. **Use Secure TLS**: TLS 1.2 or higher
 
----
-
-## 📊 Constants (HARDCODE THESE - Always True for LocalStack)
-
-- **LocalStack AMI**: `ami-ff0fea8310f3` (for ALL EC2 instances)
-- **LocalStack Endpoint**: `http://localhost:4566` (for ALL services)
-- **AWS Region**: `us-east-1`
-- **Test Credentials**: `access_key = "test"`, `secret_key = "test"`
-- **S3 Encryption**: Use `AES256` (not KMS for simplicity in LocalStack)
-- **S3 Path Style**: `s3_use_path_style = true` (required for LocalStack)
-
 ### Common Ports:
 
 - **Port 80**: HTTP
@@ -498,7 +487,7 @@ resource "aws_ecr_repository" "example" {
 
 ### File Organization:
 
-- **provider.tf**: AWS provider configuration for LocalStack
+- **provider.tf**: AWS provider configuration
 - **main.tf**: ALL application resources with security configurations
 
 ---
@@ -508,4 +497,3 @@ resource "aws_ecr_repository" "example" {
 - Full tfsec AWS checks: https://aquasecurity.github.io/tfsec/latest/checks/aws/
 - tfsec GitHub: https://github.com/aquasecurity/tfsec
 - AWS Security Best Practices: https://docs.aws.amazon.com/security/
-- LocalStack Documentation: https://docs.localstack.cloud/

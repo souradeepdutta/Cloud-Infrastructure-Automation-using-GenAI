@@ -32,25 +32,25 @@ class GraphState(TypedDict):
 
 
 # Google Gemini
-# llm = ChatGoogleGenerativeAI(
-#     model="gemini-2.5-flash",
-#     temperature=0.0,
-#     google_api_key=os.getenv("GOOGLE_API_KEY")
-# )
-# print("✓ Using Google Gemini API")
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0.0,
+    google_api_key=os.getenv("GOOGLE_API_KEY")
+)
+print("✓ Using Google Gemini API")
 
 # GitHub Models (using OpenAI-compatible API)
-from langchain_openai import ChatOpenAI
-llm = ChatOpenAI(
-    model="gpt-5",
-    temperature=0.0,
-    api_key=os.getenv("GITHUB_TOKEN"),
-    base_url="https://models.inference.ai.azure.com",
-    default_headers={
-        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}"
-    }
-)
-print("✓ Using GitHub Models API")
+# from langchain_openai import ChatOpenAI
+# llm = ChatOpenAI(
+#     model="gpt-5",
+#     temperature=0.0,
+#     api_key=os.getenv("GITHUB_TOKEN"),
+#     base_url="https://models.inference.ai.azure.com",
+#     default_headers={
+#         "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}"
+#     }
+# )
+# print("✓ Using GitHub Models API")
 
 # --- Helper Functions ---
 
@@ -74,9 +74,9 @@ RDS: storage_encrypted + not publicly_accessible + backup_retention>=7
 def _create_fallback_structure(initial_request: str) -> dict:
     """Creates a fallback plan structure when LLM response fails."""
     return {
-        "plan": "1. Configure AWS provider for LocalStack\n2. Create requested resources with security",
+        "plan": "1. Configure AWS provider\n2. Create requested resources with security",
         "file_structure": [
-            {"file_name": "provider.tf", "brief": "AWS provider for LocalStack: region us-east-1, test creds, all endpoints http://localhost:4566"},
+            {"file_name": "provider.tf", "brief": "Standard AWS provider configuration for the 'us-east-1' region."},
             {"file_name": "main.tf", "brief": f"Create all resources needed for: {initial_request}"}
         ]
     }
@@ -132,7 +132,7 @@ OUTPUT JSON:
 {{
   "plan": "1. Setup provider\\n2. Create [specific resource]\\n3. Add [specific security config]",
   "files": [
-    {{"file_name": "provider.tf", "brief": "AWS provider for LocalStack: region us-east-1, test creds, all endpoints http://localhost:4566"}},
+    {{"file_name": "provider.tf", "brief": "Standard AWS provider for region us-east-1"}},
     {{"file_name": "main.tf", "brief": "Resource-by-resource list with key attributes. Example: aws_s3_bucket 'bucket1' bucket='name', aws_s3_bucket_server_side_encryption_configuration 'bucket1' sse_algorithm=AES256, aws_s3_bucket_public_access_block 'bucket1' all=true, aws_s3_bucket_versioning 'bucket1' status=Enabled"}}
   ]
 }}
@@ -190,12 +190,12 @@ Brief: {brief}
 
 RULES:
 - Follow the brief exactly - it contains all resource names and key attributes
-- For provider.tf: LocalStack endpoints (us-east-1, test/test, http://localhost:4566)
+- For provider.tf: Use a standard AWS provider configuration (region us-east-1)
 - Use .id for resource references (e.g., aws_s3_bucket.name.id)
 - Keep code clean and minimal
 - Output pure HCL code only
 
-**Correct provider.tf for LocalStack:**
+**Correct provider.tf for AWS:**
 ```hcl
 terraform {{
   required_providers {{
@@ -207,26 +207,7 @@ terraform {{
 }}
 
 provider "aws" {{
-  region                      = "us-east-1"
-  access_key                  = "test"
-  secret_key                  = "test"
-  skip_credentials_validation = true
-  skip_metadata_api_check     = true
-  skip_requesting_account_id  = true
-  s3_use_path_style           = true
-
-  endpoints {{
-    s3           = "http://localhost:4566"
-    lambda       = "http://localhost:4566"
-    dynamodb     = "http://localhost:4566"
-    apigateway   = "http://localhost:4566"
-    iam          = "http://localhost:4566"
-    sts          = "http://localhost:4566"
-    sqs          = "http://localhost:4566"
-    sns          = "http://localhost:4566"
-    ec2          = "http://localhost:4566"
-    rds          = "http://localhost:4566"
-  }}
+  region = "us-east-1"
 }}
 ```
 
@@ -286,10 +267,10 @@ class CodeValidatorAgent:
 
 
 class DeployerAgent:
-    """Deploys the validated code to LocalStack."""
+    """Deploys the validated code to AWS."""
     
     def run(self, state: GraphState):
-        print("\n🚀 Deploying to LocalStack...")
+        print("\n🚀 Deploying to AWS...")
         if not state.get("validation_passed"):
             return {"deployment_report": "Skipping deployment because validation failed."}
         

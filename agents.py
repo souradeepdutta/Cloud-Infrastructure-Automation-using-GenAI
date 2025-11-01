@@ -10,7 +10,8 @@ from tools import (
     ToolResponseMessages,
     terraform_validate_tool,
     terraform_apply_tool,
-    terraform_security_scan_tool
+    terraform_security_scan_tool,
+    terraform_cost_estimate_tool
 )
 
 # --- Configuration ---
@@ -30,6 +31,8 @@ class GraphState(TypedDict):
     security_passed: bool
     deployment_passed: bool
     retry_count: int
+    cost_report: str
+    cost_passed: bool
 
 
 # Google Gemini
@@ -84,8 +87,36 @@ def _create_fallback_structure(initial_request: str) -> dict:
 
 def _parse_llm_json_response(response_content: str) -> dict:
     """Parse LLM response that may contain JSON wrapped in markdown."""
-    cleaned = response_content.strip().replace("```json", "").replace("```", "")
-    return json.loads(cleaned.strip())
+    content = response_content.strip()
+    
+    # Remove markdown code fences
+    content = content.replace("```json", "").replace("```", "").strip()
+    
+    # Try to find JSON object boundaries
+    start_idx = content.find("{")
+    if start_idx == -1:
+        raise json.JSONDecodeError("No JSON object found", content, 0)
+    
+    # Find the matching closing brace
+    brace_count = 0
+    end_idx = -1
+    
+    for i in range(start_idx, len(content)):
+        if content[i] == '{':
+            brace_count += 1
+        elif content[i] == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                end_idx = i + 1
+                break
+    
+    if end_idx == -1:
+        raise json.JSONDecodeError("No matching closing brace", content, start_idx)
+    
+    # Extract just the JSON object
+    json_str = content[start_idx:end_idx]
+    
+    return json.loads(json_str)
 
 # --- Agent Classes ---
 
@@ -164,9 +195,39 @@ CRITICAL: The brief for main.tf MUST list EVERY resource that will be created wi
                 "retry_count": retry_count
             }
             
-        except json.JSONDecodeError as e:
-            print(f"❌ ERROR: PlannerArchitect did not return valid JSON: {e}")
-            print(f"Response was: {response.content[:500]}")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"⚠️ Warning: Could not parse LLM response as JSON: {e}")
+            print(f"Attempting to extract JSON from response...")
+            
+            # Try to extract JSON more aggressively
+            try:
+                content = response.content
+                
+                # Remove markdown code fences
+                content = content.replace("```json", "").replace("```", "")
+                
+                # Find JSON object boundaries
+                start = content.find("{")
+                end = content.rfind("}") + 1
+                
+                if start >= 0 and end > start:
+                    json_str = content[start:end]
+                    parsed = json.loads(json_str)
+                    
+                    plan = parsed.get("plan", "")
+                    file_structure = parsed.get("files", [])
+                    
+                    if plan and file_structure:
+                        print(f"✅ Successfully extracted plan: {len(file_structure)} files to generate")
+                        return {
+                            "plan": plan,
+                            "file_structure": file_structure,
+                            "retry_count": retry_count
+                        }
+            except Exception as extraction_error:
+                print(f"❌ Could not extract valid JSON: {extraction_error}")
+            
+            print(f"Using fallback structure...")
             return {**_create_fallback_structure(state['initial_request']), "retry_count": retry_count}
 
 
@@ -384,3 +445,32 @@ class SecurityScannerAgent:
                 "validation_report": combined_report,
                 "validation_passed": False  # Mark validation as failed to trigger retry
             }
+
+
+class CostEstimatorAgent:
+    """Estimates infrastructure costs from deployed resources (post-deployment analysis)."""
+    
+    def run(self, state: GraphState):
+        print("\n💰 Analyzing deployed resource costs...")
+        print(f"   Deployment passed: {state.get('deployment_passed', False)}")
+        
+        files = state["generated_files"]
+        
+        cost_report = terraform_cost_estimate_tool.invoke({"files": files})
+        
+        # Cost estimation is informational - always pass (never blocks)
+        cost_passed = True
+        
+        # Check if cost estimation was successful
+        if "Cost estimation unavailable" in cost_report:
+            print("⚠️ Cost estimation unavailable - no resources deployed yet.")
+        else:
+            print("✅ Cost analysis complete.")
+        
+        print(f"   Cost report length: {len(cost_report)} chars")
+        
+        return {
+            "cost_report": cost_report,
+            "cost_passed": cost_passed
+        }
+

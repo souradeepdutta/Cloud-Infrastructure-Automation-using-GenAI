@@ -4,7 +4,7 @@ import uuid
 from typing import Any, Dict, Optional, Tuple, List
 
 import streamlit as st
-
+ 
 from workflow import build_workflow
 from tools import terraform_destroy_tool, save_files_to_disk
 
@@ -66,6 +66,8 @@ def initialize_session_state():
         "validation_report": "",
         "security_report": "",
         "deployment_report": "",
+        "cost_report": "",
+        "cost_passed": False,
         "process_complete": False,
         "elapsed_time": 0,
         "plan": "",
@@ -130,6 +132,7 @@ def run_workflow_with_progress(inputs: Dict[str, Any]) -> Tuple[Optional[Dict[st
             "code_generator": {"status": "pending", "output": ""},
             "code_validator": {"status": "pending", "output": ""},
             "security_scanner": {"status": "pending", "output": ""},
+            "cost_estimator": {"status": "pending", "output": ""},
             "deployer": {"status": "pending", "output": ""}
         }
     }
@@ -154,6 +157,7 @@ def run_workflow_with_progress(inputs: Dict[str, Any]) -> Tuple[Optional[Dict[st
                         "code_generator": {"status": "pending", "output": ""},
                         "code_validator": {"status": "pending", "output": ""},
                         "security_scanner": {"status": "pending", "output": ""},
+                        "cost_estimator": {"status": "pending", "output": ""},
                         "deployer": {"status": "pending", "output": ""}
                     }
                 }
@@ -181,6 +185,12 @@ def run_workflow_with_progress(inputs: Dict[str, Any]) -> Tuple[Optional[Dict[st
             if event.get("security_report"):
                 current_run["agents"]["security_scanner"]["status"] = "complete"
                 current_run["agents"]["security_scanner"]["output"] = event.get("security_report", "")
+            
+            # Track cost estimator output
+            if event.get("cost_report"):
+                current_run["agents"]["cost_estimator"]["status"] = "complete"
+                current_run["agents"]["cost_estimator"]["output"] = event.get("cost_report", "")
+                print(f"📊 Cost report captured: {len(event.get('cost_report', ''))} chars")
             
             # Track deployer output
             if event.get("deployment_report"):
@@ -214,6 +224,8 @@ def update_session_state_from_workflow(final_state: Optional[Dict[str, Any]], el
         st.session_state.validation_report = final_state.get("validation_report", "")
         st.session_state.security_report = final_state.get("security_report", "")
         st.session_state.deployment_report = final_state.get("deployment_report", "")
+        st.session_state.cost_report = final_state.get("cost_report", "")
+        st.session_state.cost_passed = final_state.get("cost_passed", False)
         st.session_state.plan = final_state.get("plan", "")
         st.session_state.process_complete = True
         st.session_state.elapsed_time = elapsed_time
@@ -297,8 +309,19 @@ if st.session_state.process_complete:
         with st.expander("Code Validator agent", expanded=False):
             if agents["code_validator"]["status"] == "complete":
                 st.markdown("✅ **Status:** Complete")
-                st.markdown("**Output:**")
-                st.text(agents["code_validator"]["output"])
+                st.markdown("**Terminal Output:**")
+                
+                output = agents["code_validator"]["output"]
+                
+                # Check if validation passed or failed
+                if "Validation successful" in output:
+                    st.success("✅ Validation Passed")
+                else:
+                    st.error("❌ Validation Failed")
+                
+                # Show full verbose output
+                with st.expander("Show verbose terminal output", expanded=False):
+                    st.code(output, language="")
             else:
                 st.markdown("⏳ **Status:** Pending")
         
@@ -306,8 +329,19 @@ if st.session_state.process_complete:
         with st.expander("Security Scanner Agent", expanded=False):
             if agents["security_scanner"]["status"] == "complete":
                 st.markdown("✅ **Status:** Complete")
-                st.markdown("**Output:**")
-                st.text(agents["security_scanner"]["output"])
+                st.markdown("**Terminal Output:**")
+                
+                output = agents["security_scanner"]["output"]
+                
+                # Check if security scan passed or failed
+                if "No security issues detected" in output or "security scan passed" in output:
+                    st.success("✅ Security Scan Passed")
+                else:
+                    st.warning("⚠️ Security Issues Found")
+                
+                # Show full verbose output
+                with st.expander("Show verbose terminal output", expanded=False):
+                    st.code(output, language="")
             else:
                 st.markdown("⏳ **Status:** Pending")
         
@@ -315,10 +349,116 @@ if st.session_state.process_complete:
         with st.expander("Deployer agent", expanded=False):
             if agents["deployer"]["status"] == "complete":
                 st.markdown("✅ **Status:** Complete")
-                st.markdown("**Output:**")
-                st.code(agents["deployer"]["output"], language="")
+                st.markdown("**Terminal Output:**")
+                
+                output = agents["deployer"]["output"]
+                
+                # Check if deployment succeeded
+                if "Terraform apply successful" in output or "Apply complete" in output:
+                    st.success("✅ Deployment Successful")
+                else:
+                    st.error("❌ Deployment Failed")
+                
+                # Show full verbose output
+                with st.expander("Show verbose terminal output", expanded=True):
+                    st.code(output, language="")
             else:
                 st.markdown("⏳ **Status:** Pending")
+        
+        # Cost Estimator Agent (runs AFTER deployment)
+        with st.expander("💰 Cost Estimator Agent", expanded=True):
+            if agents["cost_estimator"]["status"] == "complete":
+                st.markdown("✅ **Status:** Complete")
+                st.markdown("**Deployed Resource Cost Analysis:**")
+                
+                cost_output = agents["cost_estimator"]["output"]
+                
+                # Check if cost estimation is unavailable
+                if "Cost estimation unavailable" in cost_output:
+                    st.info(cost_output)
+                else:
+                    # Parse and display cost data in a nice format
+                    lines = cost_output.split('\n')
+                    
+                    # Extract total cost
+                    total_cost = "N/A"
+                    for line in lines:
+                        if "ESTIMATED MONTHLY COST:" in line:
+                            total_cost = line.split("$")[1].strip() if "$" in line else "N/A"
+                            break
+                    
+                    # Display total with metric
+                    st.metric("💰 Estimated Monthly Cost", f"${total_cost}")
+                    
+                    # Parse cost breakdown for table
+                    breakdown_data = []
+                    in_breakdown = False
+                    for line in lines:
+                        if "COST BREAKDOWN:" in line:
+                            in_breakdown = True
+                            continue
+                        if in_breakdown and "|" in line and "----" not in line and "TOTAL" not in line.upper():
+                            parts = [p.strip() for p in line.split("|") if p.strip()]
+                            if len(parts) == 3:
+                                breakdown_data.append({
+                                    "Service": parts[0],
+                                    "Resource": parts[1],
+                                    "Monthly Cost": parts[2]
+                                })
+                        if "💡 COST OPTIMIZATION SUGGESTIONS:" in line:
+                            break
+                    
+                    # Display breakdown table
+                    if breakdown_data:
+                        st.markdown("#### 📊 Cost Breakdown")
+                        import pandas as pd
+                        df = pd.DataFrame(breakdown_data)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                    
+                    # Extract and display suggestions
+                    suggestions = []
+                    in_suggestions = False
+                    for line in lines:
+                        if "💡 COST OPTIMIZATION SUGGESTIONS:" in line:
+                            in_suggestions = True
+                            continue
+                        if in_suggestions and line.strip() and line[0].isdigit():
+                            # Remove numbering
+                            suggestion = line.split(".", 1)[1].strip() if "." in line else line.strip()
+                            suggestions.append(suggestion)
+                        if "📊 GENERAL RECOMMENDATIONS:" in line:
+                            break
+                    
+                    if suggestions:
+                        st.markdown("#### 💡 Cost Optimization Suggestions")
+                        for suggestion in suggestions:
+                            st.markdown(f"- {suggestion}")
+                    
+                    # Extract and display general recommendations
+                    recommendations = []
+                    in_recommendations = False
+                    for line in lines:
+                        if "📊 GENERAL RECOMMENDATIONS:" in line:
+                            in_recommendations = True
+                            continue
+                        if in_recommendations and line.strip().startswith("•"):
+                            recommendations.append(line.strip()[1:].strip())
+                    
+                    if recommendations:
+                        st.markdown("#### 📋 General Recommendations")
+                        for rec in recommendations:
+                            st.markdown(f"- {rec}")
+                    
+                    # Show warning if cost is high
+                    try:
+                        cost_value = float(total_cost)
+                        if cost_value > 100:
+                            st.warning(f"⚠️ Monthly cost exceeds $100. Review your architecture for optimization opportunities.")
+                    except:
+                        pass
+                        
+            else:
+                st.markdown("⏳ **Status:** Pending (runs after deployment)")
         
         # Add separator between retries
         if idx < len(st.session_state.workflow_outputs) - 1:

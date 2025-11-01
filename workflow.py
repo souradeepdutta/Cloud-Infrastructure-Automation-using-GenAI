@@ -13,6 +13,7 @@ from agents import (
     GraphState,
     PlannerArchitectAgent,
     SecurityScannerAgent,
+    CostEstimatorAgent,
 )
 
 # --- Configuration ---
@@ -31,6 +32,7 @@ def get_agents():
             "generator": CodeGeneratorAgent(),
             "validator": CodeValidatorAgent(),
             "security": SecurityScannerAgent(),
+            "cost": CostEstimatorAgent(),
             "deployer": DeployerAgent()
         }
     return _agents
@@ -60,10 +62,20 @@ def security_router(state: GraphState):
 
 
 def deployment_router(state: GraphState):
-    """Route after deployment: check if deployment succeeded or needs retry."""
-    if state.get("deployment_passed"):
-        return "end"
-    return _retry_or_end_router(state)
+    """Route after deployment: always run cost estimator if deployed, otherwise retry/end."""
+    deployment_passed = state.get("deployment_passed", False)
+    
+    if deployment_passed:
+        # Deployment succeeded, run cost estimator
+        return "cost_estimator"
+    else:
+        # Deployment failed, check if we should retry
+        return _retry_or_end_router(state)
+
+
+def cost_router(state: GraphState):
+    """Route after cost estimation: always end (cost is final step)."""
+    return "end"
 
 
 def _retry_or_end_router(state: GraphState):
@@ -87,6 +99,7 @@ def build_workflow():
     workflow.add_node("code_generator", agents["generator"].run)
     workflow.add_node("code_validator", agents["validator"].run)
     workflow.add_node("security_scanner", agents["security"].run)
+    workflow.add_node("cost_estimator", agents["cost"].run)
     workflow.add_node("deployer", agents["deployer"].run)
 
     # Set entry point and simple edges
@@ -124,9 +137,16 @@ def build_workflow():
         "deployer",
         deployment_router,
         {
+            "cost_estimator": "cost_estimator",
             "end": END,
             "planner_architect": "planner_architect"
         }
+    )
+    
+    workflow.add_conditional_edges(
+        "cost_estimator",
+        cost_router,
+        {"end": END}
     )
 
     memory = MemorySaver()

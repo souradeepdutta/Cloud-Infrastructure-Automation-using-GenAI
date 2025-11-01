@@ -1,24 +1,31 @@
-# agents.py - Simplified Generic Approach
-from dotenv import load_dotenv
-load_dotenv()
-
-import os
+"""
+Agent definitions for AWS Infrastructure Generator.
+Contains all agent classes that handle planning, code generation, validation, 
+security scanning, deployment, and cost estimation.
+"""
 import json
-from typing import TypedDict, List, Dict
+import os
+from typing import Dict, List, TypedDict, Optional
+
+from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+
 from tools import (
     ToolResponseMessages,
-    terraform_validate_tool,
     terraform_apply_tool,
+    terraform_cost_estimate_tool,
     terraform_security_scan_tool,
-    terraform_cost_estimate_tool
+    terraform_validate_tool,
 )
+
+load_dotenv()
 
 # --- Configuration ---
 MAX_RETRIES = 3
 
 # --- Define Graph State ---
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
+    """State dictionary passed between agents in the workflow."""
     initial_request: str
     plan: str
     file_structure: List[Dict[str, str]]
@@ -33,6 +40,13 @@ class GraphState(TypedDict):
     retry_count: int
     cost_report: str
     cost_passed: bool
+    # Error recovery fields
+    error_analysis: Dict[str, str]
+    needs_full_retry: bool
+    fix_strategy: str
+    targeted_fix_applied: bool
+    targeted_fix_strategy: str
+    targeted_fix_description: str
 
 
 # Google Gemini
@@ -61,12 +75,13 @@ print("✓ Using Google Gemini API")
 def _load_security_rules() -> str:
     """Load security rules from TFSEC_RULES.md file with fallback."""
     rules_file = os.path.join(os.path.dirname(__file__), "TFSEC_RULES.md")
-    
+
     try:
         with open(rules_file, 'r', encoding='utf-8') as f:
             return f.read()
     except Exception as e:
         print(f"⚠️ Could not load TFSEC_RULES.md: {e}")
+        # Minimal fallback rules
         return """
 S3: 4 resources - bucket + encryption(AES256) + public_access_block(all true) + versioning(Enabled)
 EC2: metadata_options{http_tokens=required}, no public IP, encrypted EBS, security group
@@ -75,32 +90,52 @@ Lambda: IAM role + tracing_config(Active)
 RDS: storage_encrypted + not publicly_accessible + backup_retention>=7
 """
 
-def _create_fallback_structure(initial_request: str) -> dict:
-    """Creates a fallback plan structure when LLM response fails."""
+
+def _create_fallback_structure(initial_request: str) -> Dict:
+    """Create a fallback plan structure when LLM response fails."""
     return {
         "plan": "1. Configure AWS provider\n2. Create requested resources with security",
         "file_structure": [
-            {"file_name": "provider.tf", "brief": "Standard AWS provider configuration for the 'us-east-1' region."},
-            {"file_name": "main.tf", "brief": f"Create all resources needed for: {initial_request}"}
+            {
+                "file_name": "provider.tf",
+                "brief": "Standard AWS provider configuration for the 'us-east-1' region."
+            },
+            {
+                "file_name": "main.tf",
+                "brief": f"Create all resources needed for: {initial_request}"
+            }
         ]
     }
 
-def _parse_llm_json_response(response_content: str) -> dict:
-    """Parse LLM response that may contain JSON wrapped in markdown."""
+
+def _parse_llm_json_response(response_content: str) -> Dict:
+    """
+    Parse LLM response that may contain JSON wrapped in markdown.
+    Handles both clean JSON and markdown-wrapped JSON with multiple fallback strategies.
+
+    Args:
+        response_content: Raw LLM response string
+
+    Returns:
+        Parsed JSON dictionary
+
+    Raises:
+        json.JSONDecodeError: If JSON cannot be parsed
+    """
     content = response_content.strip()
-    
+
     # Remove markdown code fences
     content = content.replace("```json", "").replace("```", "").strip()
-    
-    # Try to find JSON object boundaries
+
+    # Find JSON object boundaries
     start_idx = content.find("{")
     if start_idx == -1:
         raise json.JSONDecodeError("No JSON object found", content, 0)
-    
+
     # Find the matching closing brace
     brace_count = 0
     end_idx = -1
-    
+
     for i in range(start_idx, len(content)):
         if content[i] == '{':
             brace_count += 1
@@ -109,14 +144,34 @@ def _parse_llm_json_response(response_content: str) -> dict:
             if brace_count == 0:
                 end_idx = i + 1
                 break
-    
+
     if end_idx == -1:
         raise json.JSONDecodeError("No matching closing brace", content, start_idx)
-    
-    # Extract just the JSON object
+
+    # Extract and parse the JSON object
     json_str = content[start_idx:end_idx]
-    
     return json.loads(json_str)
+
+
+def _clean_markdown_code_fences(code: str) -> str:
+    """
+    Remove markdown code fences from generated code.
+
+    Args:
+        code: Raw code string possibly containing markdown fences
+
+    Returns:
+        Cleaned code string
+    """
+    code = code.strip()
+    for fence in ["```hcl", "```terraform", "```"]:
+        if fence in code:
+            parts = code.split(fence)
+            if len(parts) >= 2:
+                code = parts[1].split("```")[0] if fence != "```" else parts[1]
+                break
+    return code.strip()
+
 
 # --- Agent Classes ---
 
@@ -183,52 +238,28 @@ CRITICAL: The brief for main.tf MUST list EVERY resource that will be created wi
             parsed = _parse_llm_json_response(response.content)
             plan = parsed.get("plan", "")
             file_structure = parsed.get("files", [])
-            
+
             if not plan or not file_structure:
                 print("⚠️ Warning: Response missing plan or files. Using fallback.")
-                return {**_create_fallback_structure(state['initial_request']), "retry_count": retry_count}
-            
+                return {
+                    **_create_fallback_structure(state['initial_request']),
+                    "retry_count": retry_count
+                }
+
             print(f"✅ Plan created: {len(file_structure)} files to generate")
             return {
                 "plan": plan,
                 "file_structure": file_structure,
                 "retry_count": retry_count
             }
-            
+
         except (json.JSONDecodeError, ValueError) as e:
             print(f"⚠️ Warning: Could not parse LLM response as JSON: {e}")
-            print(f"Attempting to extract JSON from response...")
-            
-            # Try to extract JSON more aggressively
-            try:
-                content = response.content
-                
-                # Remove markdown code fences
-                content = content.replace("```json", "").replace("```", "")
-                
-                # Find JSON object boundaries
-                start = content.find("{")
-                end = content.rfind("}") + 1
-                
-                if start >= 0 and end > start:
-                    json_str = content[start:end]
-                    parsed = json.loads(json_str)
-                    
-                    plan = parsed.get("plan", "")
-                    file_structure = parsed.get("files", [])
-                    
-                    if plan and file_structure:
-                        print(f"✅ Successfully extracted plan: {len(file_structure)} files to generate")
-                        return {
-                            "plan": plan,
-                            "file_structure": file_structure,
-                            "retry_count": retry_count
-                        }
-            except Exception as extraction_error:
-                print(f"❌ Could not extract valid JSON: {extraction_error}")
-            
-            print(f"Using fallback structure...")
-            return {**_create_fallback_structure(state['initial_request']), "retry_count": retry_count}
+            print("Using fallback structure...")
+            return {
+                **_create_fallback_structure(state['initial_request']),
+                "retry_count": retry_count
+            }
 
 
 class CodeGeneratorAgent:
@@ -244,9 +275,16 @@ class CodeGeneratorAgent:
         file_name = current_file_spec["file_name"]
         brief = current_file_spec["brief"]
 
+        # Get FULL context from state (like chat history)
+        full_context = self._build_full_context(state, file_name)
+
         print(f"\n💻 Generating {file_name}...")
+        if full_context["has_previous_files"]:
+            print(f"   📋 Context: {full_context['context_summary']}")
         
         prompt = f"""Generate HCL code for {file_name}. Output ONLY code, NO markdown, NO explanations.
+
+{full_context["context_section"]}
 
 Brief: {brief}
 
@@ -254,6 +292,7 @@ RULES:
 - Follow the brief exactly - it contains all resource names and key attributes
 - For provider.tf: Use a standard AWS provider configuration (region us-east-1)
 - Use .id for resource references (e.g., aws_s3_bucket.name.id)
+- If existing resources are listed above, reference them instead of creating duplicates
 - Keep code clean and minimal
 - Output pure HCL code only
 
@@ -332,27 +371,94 @@ resource "aws_security_group" "example" {{
 Now, generate the complete and correct HCL code for: {file_name}
 """
         response = llm.invoke(prompt)
-        
+
         # Clean up markdown formatting
-        generated_code = response.content.strip()
-        for fence in ["```hcl", "```terraform", "```"]:
-            if fence in generated_code:
-                parts = generated_code.split(fence)
-                if len(parts) >= 2:
-                    generated_code = parts[1].split("```")[0] if fence != "```" else parts[1]
-                    break
-        generated_code = generated_code.strip()
-        
+        generated_code = _clean_markdown_code_fences(response.content)
+
         print(f"✓ Generated {file_name} ({len(generated_code)} bytes)")
-        
+
         # Update generated files
         updated_files = state.get("generated_files", {})
         updated_files[file_name] = generated_code
-        
+
         return {
             "generated_files": updated_files,
             "file_structure": files_to_generate
         }
+    
+    def _build_full_context(self, state: GraphState, current_file: str) -> Dict:
+        """Build COMPLETE context like chat history - everything is in state already!"""
+        
+        # Get generated files from state
+        generated_files = state.get("generated_files", {})
+        
+        # Start with no context
+        if not generated_files and not state.get("plan"):
+            return {
+                "has_previous_files": False,
+                "context_section": "",
+                "context_summary": "First file"
+            }
+        
+        context_parts = []
+        
+        # 1. User's original request
+        if state.get("initial_request"):
+            context_parts.append(f"USER REQUEST: {state['initial_request']}")
+        
+        # 2. Overall plan
+        if state.get("plan"):
+            context_parts.append(f"\nOVERALL PLAN:\n{state['plan']}")
+        
+        # 3. Files already generated with their resources
+        if generated_files:
+            context_parts.append("\nALREADY GENERATED FILES:")
+            for filename, code in generated_files.items():
+                resources = self._extract_resources(code)
+                context_parts.append(f"\n✓ {filename}")
+                if resources:
+                    context_parts.append("  Resources defined:")
+                    for res in resources[:10]:  # Limit to avoid token overflow
+                        context_parts.append(f"    - {res}")
+        
+        # 4. Remaining files to generate
+        remaining_files = state.get("file_structure", [])
+        if remaining_files:
+            context_parts.append(f"\nREMAINING FILES: {', '.join([f['file_name'] for f in remaining_files])}")
+        
+        context_parts.append(f"\nCURRENT FILE: {current_file}\n")
+        
+        context_section = "\n".join(context_parts)
+        
+        # Summary for logging
+        file_count = len(generated_files)
+        summary = f"{file_count} files done, {len(remaining_files)} remaining"
+        
+        return {
+            "has_previous_files": len(generated_files) > 0,
+            "context_section": context_section,
+            "context_summary": summary
+        }
+    
+    def _extract_resources(self, code: str) -> List[str]:
+        """Extract resource identifiers from Terraform code."""
+        import re
+        
+        resources = []
+        
+        # Match: resource "type" "name"
+        resource_pattern = r'resource\s+"([^"]+)"\s+"([^"]+)"'
+        matches = re.findall(resource_pattern, code)
+        for resource_type, resource_name in matches:
+            resources.append(f"{resource_type}.{resource_name}")
+        
+        # Match: data "type" "name"
+        data_pattern = r'data\s+"([^"]+)"\s+"([^"]+)"'
+        data_matches = re.findall(data_pattern, code)
+        for data_type, data_name in data_matches:
+            resources.append(f"data.{data_type}.{data_name}")
+        
+        return resources
 
 
 class CodeValidatorAgent:
@@ -473,4 +579,294 @@ class CostEstimatorAgent:
             "cost_report": cost_report,
             "cost_passed": cost_passed
         }
+
+
+class ErrorAnalyzerAgent:
+    """Analyzes errors and determines if targeted fix is possible."""
+    
+    def run(self, state: GraphState):
+        print("\n🔍 Analyzing error...")
+        
+        # Determine which error we're dealing with
+        error_report = ""
+        error_type = ""
+        
+        if not state.get("validation_passed"):
+            error_report = state.get("validation_report", "")
+            error_type = "validation"
+        elif not state.get("security_passed"):
+            error_report = state.get("security_report", "")
+            error_type = "security"
+        elif not state.get("deployment_passed"):
+            error_report = state.get("deployment_report", "")
+            error_type = "deployment"
+        
+        if not error_report:
+            print("❌ No error report found")
+            return {"needs_full_retry": True, "error_analysis": "No error report"}
+        
+        # Pattern matching for common fixable errors
+        fixable, analysis = self._analyze_error_pattern(error_report, error_type)
+        
+        if fixable:
+            print(f"✅ Fixable error detected: {analysis['category']}")
+            print(f"   Strategy: {analysis['strategy']}")
+            return {
+                "needs_full_retry": False,
+                "error_analysis": analysis,
+                "fix_strategy": analysis['strategy']
+            }
+        else:
+            print(f"⚠️ Complex error - needs full retry")
+            return {
+                "needs_full_retry": True,
+                "error_analysis": analysis
+            }
+    
+    def _analyze_error_pattern(self, error_report: str, error_type: str) -> tuple:
+        """Pattern match common errors."""
+        import re
+        
+        error_lower = error_report.lower()
+        
+        # Define error patterns with their metadata
+        error_patterns = [
+            {
+                "keywords": ["already exists", "alreadyexists"],
+                "category": "resource_exists",
+                "strategy": "add_random_suffix",
+                "description_template": "Add random_id suffix to {resource}",
+                "extract_resource": lambda report: self._extract_resource_from_report(report)
+            },
+            {
+                "keywords": ["subnet", "group", "db_subnet_group_name"],
+                "all_required": False,
+                "category": "missing_subnet_group",
+                "strategy": "add_subnet_group",
+                "description_template": "Add missing DB/cache subnet group resource"
+            },
+            {
+                "keywords": ["security group", "security_group"],
+                "additional_keywords": ["not found", "does not exist"],
+                "category": "missing_security_group",
+                "strategy": "add_security_group",
+                "description_template": "Add missing security group resource"
+            },
+            {
+                "keywords": ["reference", "depends on", "no resource"],
+                "category": "invalid_reference",
+                "strategy": "fix_reference",
+                "description_template": "Fix invalid resource reference"
+            },
+            {
+                "keywords": ["iam"],
+                "additional_keywords": ["role", "policy"],
+                "required_keywords": ["not found", "does not exist"],
+                "category": "missing_iam",
+                "strategy": "add_iam_role",
+                "description_template": "Add missing IAM role/policy"
+            }
+        ]
+        
+        # Check each pattern
+        for pattern in error_patterns:
+            if self._matches_pattern(error_lower, pattern):
+                result = {
+                    "category": pattern["category"],
+                    "strategy": pattern["strategy"],
+                    "fix_description": pattern["description_template"]
+                }
+                
+                # Handle resource extraction if needed
+                if "extract_resource" in pattern:
+                    resource = pattern["extract_resource"](error_report)
+                    result["resource"] = resource
+                    result["fix_description"] = pattern["description_template"].format(resource=resource)
+                
+                return True, result
+        
+        # Unknown error - needs full retry
+        return False, {
+            "category": "unknown",
+            "strategy": "full_retry",
+            "fix_description": "Complex error requiring full regeneration"
+        }
+    
+    def _matches_pattern(self, error_lower: str, pattern: dict) -> bool:
+        """Check if error matches a specific pattern."""
+        # Check primary keywords
+        if not any(keyword in error_lower for keyword in pattern["keywords"]):
+            return False
+        
+        # Check additional keywords if specified
+        if "additional_keywords" in pattern:
+            if not any(keyword in error_lower for keyword in pattern["additional_keywords"]):
+                return False
+        
+        # Check required keywords if specified
+        if "required_keywords" in pattern:
+            if not any(keyword in error_lower for keyword in pattern["required_keywords"]):
+                return False
+        
+        return True
+    
+    def _extract_resource_from_report(self, error_report: str) -> str:
+        """Extract resource identifier from error report."""
+        import re
+        match = re.search(r'resource "([^"]+)" "([^"]+)"', error_report)
+        return f"{match.group(1)}.{match.group(2)}" if match else "unknown"
+
+
+class TargetedFixAgent:
+    """Applies targeted fixes to existing code instead of full regeneration."""
+    
+    def run(self, state: GraphState):
+        print("\n🔧 Applying targeted fix...")
+        
+        analysis = state.get("error_analysis", {})
+        strategy = analysis.get("strategy", "unknown")
+        
+        print(f"   Fix strategy: {strategy}")
+        print(f"   Description: {analysis.get('fix_description', 'N/A')}")
+        
+        # Get full context for the fix
+        context = self._build_fix_context(state)
+        
+        # Generate fix based on strategy
+        fix_prompt = self._build_fix_prompt(state, analysis, context)
+        
+        # Use LLM to generate the fix
+        response = llm.invoke(fix_prompt)
+        fixed_code = _clean_markdown_code_fences(response.content)
+        
+        # Update the main.tf file (most errors are in main.tf)
+        updated_files = state["generated_files"].copy()
+        updated_files["main.tf"] = fixed_code
+        
+        print(f"✓ Targeted fix applied to main.tf")
+        
+        return {
+            "generated_files": updated_files,
+            "targeted_fix_applied": True,
+            "targeted_fix_strategy": strategy,
+            "targeted_fix_description": analysis.get('fix_description', 'N/A')
+        }
+    
+    def _build_fix_context(self, state: GraphState) -> str:
+        """Build full context for the fix (like chat history)."""
+        context_parts = []
+        
+        # User request
+        if state.get("initial_request"):
+            context_parts.append(f"USER REQUEST: {state['initial_request']}")
+        
+        # Plan
+        if state.get("plan"):
+            context_parts.append(f"\nPLAN:\n{state['plan']}")
+        
+        # Error details
+        error_type = "validation"
+        if not state.get("validation_passed"):
+            error_report = state.get("validation_report", "")
+        elif not state.get("security_passed"):
+            error_report = state.get("security_report", "")
+            error_type = "security"
+        else:
+            error_report = state.get("deployment_report", "")
+            error_type = "deployment"
+        
+        context_parts.append(f"\nERROR TYPE: {error_type}")
+        context_parts.append(f"ERROR DETAILS:\n{error_report}")
+        
+        return "\n".join(context_parts)
+    
+    def _build_fix_prompt(self, state: GraphState, analysis: Dict, context: str) -> str:
+        """Build prompt for targeted fix."""
+        strategy = analysis.get("strategy", "unknown")
+        current_code = state["generated_files"].get("main.tf", "")
+        
+        base_prompt = f"""You are fixing a Terraform error. Apply ONLY the specific fix needed.
+
+{context}
+
+CURRENT CODE (main.tf):
+```hcl
+{current_code}
+```
+
+FIX NEEDED: {analysis.get('fix_description', 'Fix the error')}
+
+"""
+        
+        # Strategy-specific instructions
+        if strategy == "add_random_suffix":
+            resource = analysis.get('resource', 'unknown')
+            base_prompt += f"""
+SPECIFIC FIX:
+The resource '{resource}' already exists. Add random_id suffix for uniqueness.
+
+Example:
+- BEFORE: bucket = "my-bucket"
+- AFTER: bucket = "my-bucket-${{random_id.suffix.hex}}"
+
+Make sure random_id resource exists at the top. Output the COMPLETE fixed main.tf:
+"""
+        
+        elif strategy == "add_subnet_group":
+            base_prompt += """
+SPECIFIC FIX:
+Add the missing subnet group resource (aws_db_subnet_group or aws_elasticache_subnet_group).
+
+Use existing subnets from VPC (data.aws_subnets.default.ids or create new subnets).
+Then update the DB/cache resource to reference it.
+
+Output the COMPLETE fixed main.tf:
+"""
+        
+        elif strategy == "add_security_group":
+            base_prompt += """
+SPECIFIC FIX:
+Add the missing security group with appropriate rules.
+
+Consider what the resource needs:
+- RDS needs port 5432 (PostgreSQL) or 3306 (MySQL)
+- Redis/Memcached needs port 6379/11211
+- Web servers need port 80/443
+
+Output the COMPLETE fixed main.tf:
+"""
+        
+        elif strategy == "fix_reference":
+            base_prompt += """
+SPECIFIC FIX:
+Fix the invalid resource reference.
+
+Check:
+1. Resource exists and is spelled correctly
+2. Use correct syntax: resource_type.name.attribute
+3. Common attributes: .id (most), .arn (IAM), .name (some)
+
+Output the COMPLETE fixed main.tf:
+"""
+        
+        elif strategy == "add_iam_role":
+            base_prompt += """
+SPECIFIC FIX:
+Add the missing IAM role and/or policy.
+
+Include:
+1. IAM role with assume_role_policy
+2. IAM policy with required permissions
+3. IAM role policy attachment
+
+Output the COMPLETE fixed main.tf:
+"""
+        
+        else:
+            base_prompt += """
+Analyze the error and fix it. Output the COMPLETE fixed main.tf:
+"""
+        
+        return base_prompt
+
 

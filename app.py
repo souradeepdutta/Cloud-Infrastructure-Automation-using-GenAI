@@ -101,6 +101,7 @@ def initialize_session_state():
         "generated_files": {},
         "validation_passed": False,
         "security_passed": False,
+        "security_warning": False,
         "deployment_passed": False,
         "validation_report": "",
         "security_report": "",
@@ -332,6 +333,7 @@ def update_session_state_from_workflow(
         "generated_files": {},
         "validation_passed": False,
         "security_passed": False,
+        "security_warning": False,
         "deployment_passed": False,
         "validation_report": "",
         "security_report": "",
@@ -602,6 +604,23 @@ def _extract_bullet_list(lines: List[str], start_marker: str) -> List[str]:
 
 if st.session_state.process_complete:
     st.divider()
+
+    # Show prominent security warning if issues were detected
+    if st.session_state.get("security_warning", False):
+        st.warning("""
+        ⚠️ **Security Warning: Potential Security Issues Detected**
+        
+        The security scan (tfsec) detected potential security issues in the generated infrastructure.
+        The deployment proceeded anyway, but please review the Security Scanner report below.
+        
+        **Common issues for development/testing:**
+        - Public IP addresses assigned to EC2 instances
+        - Open SSH access (0.0.0.0/0)
+        - Public access to resources
+        
+        **Recommendation:** Review the security report and harden the infrastructure for production use.
+        """)
+        st.divider()
 
     # Time taken in small corner
     st.markdown(

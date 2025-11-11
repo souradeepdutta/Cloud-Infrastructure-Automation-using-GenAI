@@ -148,8 +148,24 @@ resource "aws_s3_bucket_logging" "example" {
 ### Complete Example:
 
 ```hcl
+# NEVER hardcode AMI IDs - use data source for latest AMI
+data "aws_ami" "amazon_linux_2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
 resource "aws_instance" "example" {
-  ami           = "ami-ff0fea8310f3"
+  ami           = data.aws_ami.amazon_linux_2.id  # Use data source, not hardcoded AMI
   instance_type = "t3.small"
 
   associate_public_ip_address = false

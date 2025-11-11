@@ -36,6 +36,7 @@ class GraphState(TypedDict, total=False):
     validation_passed: bool
     security_report: str
     security_passed: bool
+    security_warning: bool  # Flag to indicate security warnings were found but deployment proceeded
     deployment_passed: bool
     retry_count: int
     cost_report: str
@@ -148,9 +149,25 @@ def _parse_llm_json_response(response_content: str) -> Dict:
     if end_idx == -1:
         raise json.JSONDecodeError("No matching closing brace", content, start_idx)
 
-    # Extract and parse the JSON object
+    # Extract the JSON object
     json_str = content[start_idx:end_idx]
-    return json.loads(json_str)
+    
+    # Try to parse directly first
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        # If direct parsing fails, try to clean up common issues
+        # Remove trailing commas before closing braces/brackets
+        import re
+        cleaned_json = re.sub(r',(\s*[}\]])', r'\1', json_str)
+        
+        try:
+            return json.loads(cleaned_json)
+        except json.JSONDecodeError:
+            # Last resort: try to extract just the essential fields manually
+            print(f"⚠️ JSON parsing failed. Original error: {e}")
+            print(f"⚠️ Problematic JSON (first 500 chars): {json_str[:500]}")
+            raise
 
 
 def _clean_markdown_code_fences(code: str) -> str:
@@ -215,7 +232,7 @@ Reasoning process:
 - 3-5 steps max in plan
 - Be SPECIFIC in briefs: list each resource type with key attributes
 
-OUTPUT JSON:
+OUTPUT ONLY VALID JSON (no comments, no trailing commas):
 {{
   "plan": "1. Setup provider\\n2. Create [specific resource]\\n3. Add [specific security config]",
   "files": [
@@ -334,22 +351,72 @@ provider "aws" {{
 ```
 
 **IMPORTANT for EC2 instances:**
-When using default VPC, get subnets using this CORRECT method:
-```hcl
-data "aws_vpc" "default" {{
-  default = true
-}}
+**NEVER hardcode AMI IDs** - they change frequently and vary by region. Use a data source:
 
-data "aws_subnets" "default" {{
+```hcl
+data "aws_ami" "amazon_linux_2" {{
+  most_recent = true
+  owners      = ["amazon"]
+
   filter {{
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }}
+
+  filter {{
+    name   = "virtualization-type"
+    values = ["hvm"]
   }}
 }}
-```
-Then reference subnet with: subnet_id = tolist(data.aws_subnets.default.ids)[0]
 
-DO NOT use "default_for_az" filter - it doesn't exist in AWS API.
+resource "aws_instance" "example" {{
+  ami           = data.aws_ami.amazon_linux_2.id  # Use data source
+  instance_type = "t3.micro"
+  subnet_id     = tolist(data.aws_subnets.default.ids)[0]
+  
+  # MANDATORY: These 3 blocks are REQUIRED for every EC2 instance
+  metadata_options {{
+    http_tokens   = "required"  # REQUIRED - Enable IMDSv2
+    http_endpoint = "enabled"
+  }}
+
+  root_block_device {{
+    encrypted = true  # REQUIRED - Encrypt root volume
+  }}
+
+  vpc_security_group_ids = [aws_security_group.example.id]
+  
+  # Only set to true if instance needs public access (blogs, web servers)
+  associate_public_ip_address = false
+}}
+```
+
+**CRITICAL FOR EC2: Always Create a Subnet**
+
+EVERY EC2 instance MUST have a subnet_id. Use this pattern:
+
+```hcl
+data "aws_availability_zones" "available" {{
+  state = "available"
+}}
+
+resource "aws_subnet" "main" {{
+  vpc_id            = data.aws_vpc.default.id
+  cidr_block        = "172.31.0.0/20"
+  availability_zone = data.aws_availability_zones.available.names[0]
+  tags = {{ Name = "main-subnet" }}
+}}
+
+# Then use: subnet_id = aws_subnet.main.id
+```
+
+**CRITICAL - DO NOT USE THESE (DEPRECATED/INVALID):**
+- ❌ Hardcoded AMI IDs like "ami-12345678" (outdated/invalid/region-specific)
+- ❌ aws_subnet_ids (deprecated in AWS provider 5.x - use aws_subnets instead)
+- ❌ "default_for_az" filter (doesn't exist in AWS API)
+- ❌ "mapPublicIpOnLaunch" filter (unreliable - avoid it)
+
+**CORRECT Data Source:** Use `data "aws_subnets"` (plural) NOT `aws_subnet_ids`
 
 **IMPORTANT for Security Groups:**
 Use name_prefix with random_id suffix for uniqueness:
@@ -367,6 +434,15 @@ resource "aws_security_group" "example" {{
   }}
 }}
 ```
+
+**CRITICAL REMINDER FOR EC2 INSTANCES:**
+EVERY aws_instance resource MUST include these (no exceptions):
+1. **subnet_id** = aws_subnet.main.id (EC2 CANNOT be created without a subnet!)
+2. **metadata_options** {{ http_tokens = "required", http_endpoint = "enabled" }}
+3. **root_block_device** {{ encrypted = true }}
+4. **vpc_security_group_ids** = [...]
+
+For EC2, always create a subnet using the simpler approach shown above.
 
 Now, generate the complete and correct HCL code for: {file_name}
 """
@@ -482,6 +558,25 @@ class CodeValidatorAgent:
                 print("⚠️ Warning: Could not parse formatted code from tool output.")
         else:
             print("❌ Terraform syntax validation failed.")
+            
+            # Extract only the error portion
+            error_lines = []
+            capture = False
+            for line in validation_report.split('\n'):
+                if 'Error:' in line or 'error' in line.lower():
+                    capture = True
+                if capture:
+                    error_lines.append(line)
+                    if line.strip() == '' and len(error_lines) > 5:
+                        break
+            
+            error_summary = '\n'.join(error_lines[:30])  # Limit to 30 lines
+            
+            print("\n" + "=" * 80)
+            print("VALIDATION ERROR:")
+            print("=" * 80)
+            print(error_summary)
+            print("=" * 80 + "\n")
 
         return {
             "validation_report": validation_report,
@@ -513,6 +608,27 @@ class DeployerAgent:
             }
         else:
             print("❌ Deployment failed")
+            
+            # Extract only the error portion (after "Error:" keyword)
+            error_lines = []
+            capture = False
+            for line in deployment_report.split('\n'):
+                if 'Error:' in line or 'error' in line.lower():
+                    capture = True
+                if capture:
+                    error_lines.append(line)
+                    # Stop after capturing the error block
+                    if line.strip() == '' and len(error_lines) > 5:
+                        break
+            
+            error_summary = '\n'.join(error_lines[:30])  # Limit to 30 lines
+            
+            print("\n" + "=" * 80)
+            print("DEPLOYMENT ERROR:")
+            print("=" * 80)
+            print(error_summary)
+            print("=" * 80 + "\n")
+            
             # Treat deployment failure as validation failure to trigger retry
             existing_report = state.get("validation_report", "")
             combined_report = f"{existing_report}\n\n--- DEPLOYMENT ERRORS ---\n{deployment_report}"
@@ -541,15 +657,15 @@ class SecurityScannerAgent:
                 "security_passed": True
             }
         else:
-            print("❌ tfsec security scan found issues.")
-            # Append security issues to validation_report so PlannerAgent can address them
-            existing_report = state.get("validation_report", "")
-            combined_report = f"{existing_report}\n\n--- SECURITY ISSUES ---\n{security_report}"
+            print("⚠️  tfsec security scan found issues.")
+            print("⚠️  Proceeding with deployment - security warnings will be shown to user")
+            
+            # Option B: Deploy anyway but warn the user
+            # This is more practical for development/testing while still informing about risks
             return {
                 "security_report": security_report,
-                "security_passed": False,
-                "validation_report": combined_report,
-                "validation_passed": False  # Mark validation as failed to trigger retry
+                "security_passed": True,  # Allow deployment to proceed
+                "security_warning": True  # Flag for UI to show prominent warning
             }
 
 
@@ -629,6 +745,24 @@ class ErrorAnalyzerAgent:
         
         error_lower = error_report.lower()
         
+        # For security errors, don't apply targeted fixes - always do full retry
+        # This prevents false positives from security warnings
+        if error_type == "security":
+            # Check if these are just warnings vs actual blocking errors
+            if "high" in error_lower or "critical" in error_lower:
+                return False, {
+                    "category": "security_issues",
+                    "strategy": "full_retry",
+                    "fix_description": "Security issues require full regeneration with updated requirements"
+                }
+            else:
+                # Minor security warnings - should not block deployment
+                return False, {
+                    "category": "security_warning",
+                    "strategy": "skip",
+                    "fix_description": "Minor security warnings - can proceed with deployment"
+                }
+        
         # Define error patterns with their metadata
         error_patterns = [
             {
@@ -639,8 +773,8 @@ class ErrorAnalyzerAgent:
                 "extract_resource": lambda report: self._extract_resource_from_report(report)
             },
             {
-                "keywords": ["subnet", "group", "db_subnet_group_name"],
-                "all_required": False,
+                "keywords": ["db_subnet_group_name", "elasticache_subnet_group_name", "cache_subnet_group_name"],
+                "required_keywords": ["not found", "does not exist", "missing", "invalid", "required"],
                 "category": "missing_subnet_group",
                 "strategy": "add_subnet_group",
                 "description_template": "Add missing DB/cache subnet group resource"

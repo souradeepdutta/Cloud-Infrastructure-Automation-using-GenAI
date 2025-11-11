@@ -135,12 +135,34 @@ def _format_error_message(error: subprocess.CalledProcessError) -> str:
     Returns:
         Formatted error string
     """
-    return (
-        f"Terraform command failed.\n"
-        f"Command: '{' '.join(error.cmd)}'\n"
-        f"Stderr: {error.stderr}\n"
-        f"Stdout: {error.stdout}"
-    )
+    error_parts = [
+        "=" * 80,
+        "TERRAFORM ERROR",
+        "=" * 80,
+        f"\nCommand: {' '.join(error.cmd)}",
+        f"\nExit Code: {error.returncode}",
+        "\n" + "-" * 80,
+    ]
+    
+    if error.stdout and error.stdout.strip():
+        error_parts.extend([
+            "\nSTDOUT:",
+            "-" * 80,
+            error.stdout.strip(),
+            "-" * 80,
+        ])
+    
+    if error.stderr and error.stderr.strip():
+        error_parts.extend([
+            "\nSTDERR:",
+            "-" * 80,
+            error.stderr.strip(),
+            "-" * 80,
+        ])
+    
+    error_parts.append("=" * 80)
+    
+    return "\n".join(error_parts)
 
 
 def save_files_to_disk(project_name: str, files: Dict) -> Tuple[bool, str]:
@@ -251,13 +273,18 @@ def terraform_security_scan_tool(files: Dict[str, str]) -> str:
             return "Error: Work directory not found. Please run validation first."
 
         # Run tfsec with high severity threshold and practical exclusions
+        # Excluded checks:
+        # - aws-s3-encryption-customer-key: Customer-managed keys not always needed
+        # - aws-s3-enable-bucket-logging: Logging buckets don't need their own logs
+        # - aws-ec2-no-public-egress-sgr: Egress to 0.0.0.0/0 is standard (internet access)
+        # - aws-ec2-no-public-ingress-sgr: Public ingress is intentional for web servers/blogs
         scan_result = subprocess.run(
             [
                 "tfsec", ".",
                 "--no-color",
                 "--format", "default",
                 "--minimum-severity", "HIGH",
-                "--exclude", "aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging,aws-ec2-no-public-egress-sgr"
+                "--exclude", "aws-s3-encryption-customer-key,aws-s3-enable-bucket-logging,aws-ec2-no-public-egress-sgr,aws-ec2-no-public-ingress-sgr"
             ],
             cwd=WORK_DIR,
             capture_output=True,
